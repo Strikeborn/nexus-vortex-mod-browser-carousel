@@ -4,7 +4,7 @@ import { logEnhancerError, logEnhancerInfo } from './logger';
 
 const GRAPHQL_URL = 'https://api-router.nexusmods.com/graphql';
 const NEXUS_REST = 'https://api.nexusmods.com/v1';
-const USER_AGENT = 'Vortex/BuiltinModBrowserEnhanced/1.0.0';
+const USER_AGENT = 'Vortex/ModBrowserCarousel/1.2.1';
 
 interface NexusAccount {
   APIKey?: string;

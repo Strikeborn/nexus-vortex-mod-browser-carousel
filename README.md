@@ -5,7 +5,7 @@ A Vortex extension that replaces the default Browse tab with a carousel-style Ne
 ## Requirements
 
 - [Vortex Mod Manager](https://www.nexusmods.com/about/vortex/)
-- Disable the built-in **Builtin Mod Browser** extension (Settings → Extensions) to avoid duplicate Browse tabs
+- Only enable **one** Browse-tab extension at a time (this one replaces older Browse carousel forks)
 
 ## Install (local build)
 

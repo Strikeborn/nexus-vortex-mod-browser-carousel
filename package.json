@@ -1,6 +1,6 @@
 {
   "name": "mod-browser-carousel",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Nexus Vortex mod browser carousel with one-click install: multi-row grid, filters, batch paging, and Nexus integration.",
   "main": "./out/index.js",
   "repository": "https://github.com/Strikeborn/nexus-vortex-mod-browser-carousel",

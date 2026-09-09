@@ -8,11 +8,41 @@ $DisabledRoot = Join-Path (Split-Path $PluginsRoot -Parent) "plugins-disabled"
 $LegacyDisabledRoot = Join-Path $PluginsRoot "_disabled"
 $DistDir = Join-Path $ProjectRoot "dist"
 
-$LegacyBrowseFolders = @(
-    "strikeborn-mod-browser",
-    "builtin-mod-browser-enhanced",
-    "Builtin Mod Browser-88-1-0-4-1647308005"
-)
+function Archive-LegacyBrowsePlugin {
+    param([string]$SourcePath)
+
+    if (-not (Test-Path $SourcePath)) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $DisabledRoot | Out-Null
+    $name = Split-Path $SourcePath -Leaf
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $dest = Join-Path $DisabledRoot ($name + "-" + $stamp)
+
+    Write-Host "Archiving legacy Browse plugin:"
+    Write-Host "  $SourcePath"
+    Write-Host "  -> $dest"
+    Move-Item -Path $SourcePath -Destination $dest -Force
+}
+
+function Archive-LegacyBrowsePlugins {
+    if (-not (Test-Path $PluginsRoot)) {
+        return
+    }
+
+    Get-ChildItem -Path $PluginsRoot -Directory | ForEach-Object {
+        $name = $_.Name
+        if ($name -eq $PluginId) {
+            return
+        }
+        if ($name -like "Builtin Mod Browser*" -or
+            $name -like "builtin-mod-browser*" -or
+            $name -eq "strikeborn-mod-browser") {
+            Archive-LegacyBrowsePlugin -SourcePath $_.FullName
+        }
+    }
+}
 
 function Migrate-LegacyDisabledFolder {
     if (-not (Test-Path $LegacyDisabledRoot)) {
@@ -34,22 +64,21 @@ function Migrate-LegacyDisabledFolder {
     }
 }
 
-function Disable-LegacyBrowsePlugin {
-    param([string]$FolderName)
-
-    $source = Join-Path $PluginsRoot $FolderName
-    if (-not (Test-Path $source)) {
+function Remove-ArchivedBrowsePlugins {
+    if (-not (Test-Path $DisabledRoot)) {
         return
     }
 
-    New-Item -ItemType Directory -Force -Path $DisabledRoot | Out-Null
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $dest = Join-Path $DisabledRoot ($FolderName + "-" + $stamp)
-
-    Write-Host "Archiving legacy Browse plugin:"
-    Write-Host "  $source"
-    Write-Host "  -> $dest"
-    Move-Item -Path $source -Destination $dest -Force
+    Get-ChildItem -Path $DisabledRoot -Directory | ForEach-Object {
+        $name = $_.Name
+        if ($name -like "Builtin Mod Browser*" -or
+            $name -like "builtin-mod-browser*" -or
+            $name -like "strikeborn-mod-browser*") {
+            Write-Host "Removing archived Browse plugin:"
+            Write-Host "  $($_.FullName)"
+            Remove-Item -Path $_.FullName -Recurse -Force
+        }
+    }
 }
 
 Push-Location $ProjectRoot
@@ -67,11 +96,9 @@ try {
         throw "Build output missing: dist\info.json"
     }
 
-    foreach ($folder in $LegacyBrowseFolders) {
-        Disable-LegacyBrowsePlugin -FolderName $folder
-    }
-
+    Archive-LegacyBrowsePlugins
     Migrate-LegacyDisabledFolder
+    Remove-ArchivedBrowsePlugins
 
     Write-Host "Deploying to: $DeployDir"
     New-Item -ItemType Directory -Force -Path $DeployDir | Out-Null
@@ -86,9 +113,8 @@ try {
     Write-Host ""
     Write-Host "Next steps:"
     Write-Host "  1. Fully restart Vortex (close completely, then reopen)"
-    Write-Host "  2. Settings -> Extensions: disable Builtin Mod Browser and any old Browse plugins"
-    Write-Host "  3. Enable only: Nexus Vortex Mod Browser Carousel w/ 1 click install"
-    Write-Host "  4. Open Browse and confirm Nexus loads normally"
+    Write-Host "  2. Settings -> Extensions: keep only Nexus Vortex Mod Browser Carousel w/ 1 click install enabled for Browse"
+    Write-Host "  3. Open Browse and confirm Nexus loads normally"
 }
 finally {
     Pop-Location
