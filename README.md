@@ -20,7 +20,7 @@ Fully restart Vortex after deploy.
 
 1. Download `mod-browser-carousel.7z` from [GitHub Releases](https://github.com/Strikeborn/nexus-vortex-mod-browser-carousel/releases)
 2. In Vortex: **Settings → Extensions**
-3. Drag the `.7z` onto the extensions page (or use **Install from file**)
+3. Drag the `.7z` onto the extensions page file icon at the bottom (or use **Install from file**)
 
 ## Build release bundle
 
