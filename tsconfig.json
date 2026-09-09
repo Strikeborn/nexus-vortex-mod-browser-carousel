@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+      "target": "es6",
+      "module": "commonjs",
+      "moduleResolution": "node",
+      "noImplicitAny": false,
+      "removeComments": true,
+      "preserveConstEnums": true,
+      "rootDir": "./src",
+      "outDir": "./out",
+      "jsx": "react",
+      "sourceMap": false
+    },
+      "exclude": [
+        "node_modules"
+      ],
+    "files": [
+      "src/index.ts",
+      "src/BrowseView.tsx",
+      "src/installedMods.ts",
+      "src/injectionScript.ts",
+      "src/webviewBridge.ts",
+      "src/logger.ts",
+      "src/nexusInstall.ts",
+      "src/bridgeMessages.ts",
+      "src/modUid.ts",
+      "src/modDependencies.ts",
+      "src/nexusActions.ts",
+      "src/vortexUiLayout.ts",
+      "src/browseSession.ts",
+      "src/styles.css.d.ts",
+    ]
+  }

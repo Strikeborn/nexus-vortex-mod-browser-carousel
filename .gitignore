@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.7z
+
+# Generated TypeScript/CSS module typings
+src/**/*.css.d.ts
+
+# Logs
+*.log
+logs/
+
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.cursor/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Agent / scratch (not part of the extension)
+.openhands/
+project context.txt
+renderer.js
+test-script-syntax.js
+
+# Accidental local Vortex / game data — never commit install trees
+mods/
+**/mods/
+downloads/
+staging/
+snapshots/
+profiles/
+*_staging_folder
+__vortex_*
+
+# Yarn (project uses npm)
+yarn-error.log
+yarn.lock
