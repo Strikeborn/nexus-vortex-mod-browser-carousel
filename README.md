@@ -1,6 +1,6 @@
 # Nexus Vortex Mod Browser Carousel w/ 1 click install
 
-A Vortex extension that replaces the default Browse tab with a carousel-style Nexus mod grid: configurable rows/columns, batch paging, Vortex-side filters, one-click install, and optional hide-site-chrome mode.
+A Vortex extension that replaces the default Browse tab with a carousel-style Nexus mod grid: configurable rows/columns, batch paging, Vortex-side filters, one-click install, and optional hide-title-and-address-bar mode.
 
 ## Requirements
 
