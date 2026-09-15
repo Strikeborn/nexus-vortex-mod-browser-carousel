@@ -1,6 +1,38 @@
 let sessionBrowseUrl: string | null = null;
 let sessionGameSlug: string | null = null;
 
+export function urlHasActiveNexusFilters(url: string): boolean {
+  if (!url) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const keys: string[] = [];
+    parsed.searchParams.forEach((_, key) => {
+      if (keys.indexOf(key) < 0) {
+        keys.push(key);
+      }
+    });
+
+    return keys.some((key) => {
+      if (key === 'count' || key === 'page' || key === 'p' || key === 'offset') {
+        return false;
+      }
+      if (/^sort/i.test(key) || key === 'direction' || key === 'order') {
+        return false;
+      }
+      if (key === 'excludedTag') {
+        const tags = parsed.searchParams.getAll('excludedTag');
+        return !(tags.length === 1 && tags[0] === 'Translation');
+      }
+      return true;
+    });
+  } catch (err) {
+    return false;
+  }
+}
+
 export function getBrowseSessionKey(url: string): string {
   if (!url) {
     return '';

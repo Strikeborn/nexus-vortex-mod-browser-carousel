@@ -4,13 +4,19 @@ import { types } from 'vortex-api';
 
 const PREFIX = '[Mod Browser Carousel]';
 let logFilePath: string = null;
+let traceFilePath: string = null;
 
 export function initEnhancerLogger(api: types.IExtensionApi): string {
   try {
     const logsDir = path.join(process.env.APPDATA || api.getPath('userData'), 'Vortex', 'logs');
     fs.mkdirSync(logsDir, { recursive: true });
     logFilePath = path.join(logsDir, 'mod-browser-carousel.log');
+    traceFilePath = path.join(logsDir, 'mod-browser-carousel-trace.log');
     appendLogLine('Logger initialized');
+    appendTraceLine('session-start', {
+      logPath: logFilePath,
+      tracePath: traceFilePath,
+    });
   } catch (err) {
     console.error(PREFIX, 'Failed to initialize log file', err);
   }
@@ -19,6 +25,10 @@ export function initEnhancerLogger(api: types.IExtensionApi): string {
 
 export function getEnhancerLogPath(): string {
   return logFilePath;
+}
+
+export function getEnhancerTracePath(): string {
+  return traceFilePath;
 }
 
 function appendLogLine(line: string): void {
@@ -32,6 +42,25 @@ function appendLogLine(line: string): void {
   } catch (err) {
     console.error(PREFIX, 'Failed to write log file', err);
   }
+}
+
+function appendTraceLine(message: string, detail?: any): void {
+  const suffix = detail !== undefined ? ` ${safeStringify(detail)}` : '';
+  const stamped = `[${new Date().toISOString()}] TRACE ${message}${suffix}\n`;
+  if (traceFilePath) {
+    try {
+      fs.appendFileSync(traceFilePath, stamped);
+    } catch (err) {
+      console.error(PREFIX, 'Failed to write trace file', err);
+    }
+  }
+  if (message.indexOf('error') >= 0 || message.indexOf('failed') >= 0) {
+    appendLogLine(`TRACE ${message}${suffix}`);
+  }
+}
+
+export function appendWebviewTrace(message: string, detail?: any): void {
+  appendTraceLine(`[webview] ${message}`, detail);
 }
 
 function formatError(err: any): string {

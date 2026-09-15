@@ -5,7 +5,7 @@ import {
   EXTENSION_DISPLAY_NAME,
   EXTENSION_NAMESPACE,
 } from './extensionMeta';
-import { initEnhancerLogger, logEnhancerInfo } from './logger';
+import { getEnhancerTracePath, initEnhancerLogger, logEnhancerInfo } from './logger';
 
 export { BROWSE_PAGE_ID, EXTENSION_NAMESPACE, EXTENSION_DISPLAY_NAME, LEGACY_BROWSE_PAGE_IDS } from './extensionMeta';
 
@@ -63,7 +63,11 @@ function warnIfDuplicateBrowseExtensions(api: types.IExtensionApi) {
 
 function main(context: types.IExtensionContext) {
   const logPath = initEnhancerLogger(context.api);
-  logEnhancerInfo('Extension loaded', { logPath, namespace: EXTENSION_NAMESPACE });
+  logEnhancerInfo('Extension loaded', {
+    logPath,
+    tracePath: getEnhancerTracePath(),
+    namespace: EXTENSION_NAMESPACE,
+  });
 
   context.once(() => {
     try {

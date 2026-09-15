@@ -13,7 +13,7 @@ import {
 } from './installedMods';
 import { EnhancerConfig } from './injectionScript';
 import { WebviewBridge } from './webviewBridge';
-import { logEnhancerError, logEnhancerInfo } from './logger';
+import { appendWebviewTrace, logEnhancerError, logEnhancerInfo } from './logger';
 import { parseBridgeMessage } from './bridgeMessages';
 import { safeInstallModFromBrowse } from './nexusInstall';
 import { fetchDependencySummaries, ModDependencyMap } from './modDependencies';
@@ -56,8 +56,16 @@ import {
   rememberBrowseUrl,
   resolveBrowseWebviewSrc,
   urlsMatchGame,
+  getBrowseSessionKey,
+  urlHasActiveNexusFilters,
 } from './browseSession';
 import { BrowseCatalogCache } from './browseCatalogCache';
+import {
+  buildNexusWebLoginUrl,
+  isNexusAuthUrl,
+  isNexusBrowseModsUrl,
+  NEXUS_WEBVIEW_PARTITION,
+} from './nexusWebSession';
 
 class Props {
   api: types.IExtensionApi;
@@ -79,6 +87,9 @@ interface BrowseViewState {
   hideSiteChrome: boolean;
   trackedListLoaded: boolean;
   tabActive: boolean;
+  webviewSrc: string;
+  nexusWebLoggedIn: boolean;
+  domFilterBrowseActive: boolean;
 }
 
 export default class BrowseView extends React.Component<Props, BrowseViewState> {
@@ -96,6 +107,26 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
   private pageVisibilityUnsubscribe: () => void = null;
   private showMainPageHandler: (pageId: string) => void = null;
   private webviewListenersAttached = false;
+  private boundWebviewNode: any = null;
+  private suppressNavigationEnhancementUntil = 0;
+  private browseGameMatchVerified = false;
+  private lastBrowseFinishLoadKey = '';
+  private lastBrowseFinishPathKey = '';
+  private lastBrowseFinishLoadAt = 0;
+  private browseEnhancementBootstrapTimer: any = null;
+  private browseEnhancementInjected = false;
+  private lastBrowseNavigateKey = '';
+  private lastBrowseNavigateAt = 0;
+  private lastBootstrapSrcKey = '';
+  private lastBootstrapAt = 0;
+  private lastBrowseFilterSessionKey = '';
+  private lastFilteredBrowseRefreshAt = 0;
+  private filteredBrowseRefreshGen = 0;
+  private filteredBrowseRefreshPending = false;
+  private lastFilterTransitionAt = 0;
+  private refreshEnhancementTimer: any = null;
+  private pendingRefreshDelay = 250;
+  private nexusWebLoginSyncInFlight = false;
 
   private static isBrowseTabActive(api: types.IExtensionApi, pageId: string): boolean {
     return isBrowseWebviewVisible(api.store.getState().session || {}, pageId);
@@ -103,7 +134,11 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
 
   constructor(props: Props) {
     super(props);
-    this.shouldApplyDefaultFilters = isDefaultBrowseLanding(this.getGame());
+    const game = this.getGame();
+    this.shouldApplyDefaultFilters = isDefaultBrowseLanding(game);
+    clearBrowseSessionIfGameMismatch(game);
+    this.resolvedWebviewSrc = resolveBrowseWebviewSrc(game);
+    this.webView.currentUrl = this.resolvedWebviewSrc;
     this.state = {
       hideInstalled: false,
       onlyInstalled: false,
@@ -119,6 +154,9 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       hideSiteChrome: true,
       trackedListLoaded: false,
       tabActive: BrowseView.isBrowseTabActive(props.api, props.browsePageId || 'Browse'),
+      webviewSrc: this.resolvedWebviewSrc,
+      nexusWebLoggedIn: false,
+      domFilterBrowseActive: false,
     };
   }
 
@@ -138,6 +176,8 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
   private backgroundSyncInFlight = false;
   private lastSyncedTrackedKey = '';
   private lastSyncedInstalledKey = '';
+  private browseEnhancementBootstrapKey = '';
+  private initialBrowseEnhancementDone = false;
 
   private getCatalogPageSize(): number {
     return this.state.gridColumns * this.state.gridRows;
@@ -317,9 +357,98 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       );
   }
 
+  private isWebviewBootstrapUrl(url: string): boolean {
+    if (!url) {
+      return true;
+    }
+    const normalized = String(url).trim().toLowerCase();
+    return normalized === 'about:blank' || normalized === 'about:srcdoc';
+  }
+
+  private handleNexusAuthPage(context: string) {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const src = webview && webview.src ? String(webview.src) : this.webView.currentUrl;
+    if (!isNexusAuthUrl(src)) {
+      return false;
+    }
+
+    logEnhancerInfo('nexus auth page active', { context, src });
+    void this.bridge.releaseAuthPageUI();
+    return true;
+  }
+
+  private updateNexusWebLoginState(context: string) {
+    if (!this.state.tabActive || this.nexusWebLoginSyncInFlight) {
+      return;
+    }
+
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const src = webview && webview.src ? String(webview.src) : this.webView.currentUrl;
+    if (isNexusAuthUrl(src)) {
+      if (this.state.nexusWebLoggedIn) {
+        this.setState({ nexusWebLoggedIn: false });
+      }
+      return;
+    }
+    if (!isNexusBrowseModsUrl(src)) {
+      return;
+    }
+
+    this.nexusWebLoginSyncInFlight = true;
+    void this.bridge.probeNexusWebSession().then((probe) => {
+      this.nexusWebLoginSyncInFlight = false;
+      if (!probe) {
+        return;
+      }
+      const loggedIn = probe.state !== 'login-page' && !!probe.loggedIn;
+      logEnhancerInfo('nexus web session probe', {
+        context,
+        state: probe.state,
+        loggedIn: loggedIn,
+        error: probe.error,
+      });
+      if (this.state.nexusWebLoggedIn !== loggedIn) {
+        this.setState({ nexusWebLoggedIn: loggedIn });
+      }
+    }).catch((err) => {
+      this.nexusWebLoginSyncInFlight = false;
+      logEnhancerError('nexus web session probe failed', err, { context });
+    });
+  }
+
+  openNexusWebSignIn = () => {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    if (!webview || typeof webview.loadURL !== 'function') {
+      return;
+    }
+
+    const returnUrl = this.getCurrentBrowseHref() || this.getWebviewSrc();
+    const loginUrl = buildNexusWebLoginUrl(returnUrl);
+    logEnhancerInfo('nexus web sign-in opened manually', { loginUrl, returnUrl });
+    void this.bridge.releaseAuthPageUI().then(() => {
+      webview.loadURL(loginUrl);
+    });
+  };
+
+  private getCurrentBrowseHref(): string | undefined {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const src = webview && webview.src ? String(webview.src) : '';
+    if (src && src.indexOf('nexusmods.com') >= 0 && src.indexOf('/mods') >= 0) {
+      return src;
+    }
+    const remembered = this.webView.currentUrl || this.state.webviewSrc;
+    if (remembered && remembered.indexOf('nexusmods.com') >= 0) {
+      return remembered;
+    }
+    return undefined;
+  }
+
   buildEnhancerConfig(): EnhancerConfig {
     const installed = toInstalledModsPayload(getInstalledNexusMods(this.props.api));
     const gameDomain = this.getGame();
+    const browseHref = this.getCurrentBrowseHref();
+    const filterBrowseActive = urlHasActiveNexusFilters(browseHref || '') ||
+      this.state.domFilterBrowseActive;
     const trackedModIdsForUids = this.state.onlyTracked
       ? Object.keys(this.state.trackedModIds)
           .map((modKey) => parseInt(modKey, 10))
@@ -344,6 +473,8 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       endorsed: this.state.endorsedModIds,
       viewerDownloaded: this.state.viewerDownloadedModIds,
       trackedListLoaded: this.state.trackedListLoaded,
+      browseHref,
+      filterBrowseActive,
     };
   }
 
@@ -365,7 +496,7 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     this.dependencyFetchTimer = setTimeout(() => {
       this.dependencyFetchTimer = null;
       this.loadDependencies(unique);
-    }, 150);
+    }, 50);
   }
 
   loadDependencies = async (modIds: number[]) => {
@@ -377,7 +508,11 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
         return;
       }
 
-      this.setState({ dependencyInfo: summaries }, () => this.refreshEnhancement(50));
+      this.setState({ dependencyInfo: summaries }, () => {
+        if (!urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '')) {
+          this.refreshEnhancement(50);
+        }
+      });
     } catch (err) {
       logEnhancerError('loadDependencies', err);
     }
@@ -446,7 +581,11 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
             : Object.assign({}, prev.trackedModIds, state.tracked || {}),
           endorsedModIds: Object.assign({}, prev.endorsedModIds, state.endorsed || {}),
           viewerDownloadedModIds: Object.assign({}, prev.viewerDownloadedModIds, state.downloaded || {}),
-        }), () => this.refreshEnhancement(50));
+        }), () => {
+          if (!urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '')) {
+            this.refreshEnhancement(50);
+          }
+        });
       } catch (err) {
         logEnhancerError('scheduleViewerStateFetch', err);
       }
@@ -469,11 +608,12 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
           }
           this.syncCatalogCacheAfterTrackedChange(this.state.trackedModIds);
           void this.prefetchTrackedCatalogTiles();
-          this.refreshEnhancement(0);
+          const filteredBrowse = urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '');
+          this.refreshEnhancement(filteredBrowse ? 80 : 0);
           this.bridge.showToast(nextTracked ? 'Mod tracked' : 'Mod untracked');
           setTimeout(() => {
             this.bridge.clearPending('track', modId);
-          }, 300);
+          }, 120);
         });
         return;
       }
@@ -520,14 +660,27 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     }
   }
 
-  refreshEnhancement(delay: number = 250) {
-    if (!this.state.tabActive) {
-      return;
+  refreshEnhancement(delay: number = 250): Promise<void> {
+    this.pendingRefreshDelay = Math.max(this.pendingRefreshDelay, delay);
+    if (this.refreshEnhancementTimer) {
+      return Promise.resolve();
     }
+    return new Promise((resolve) => {
+      this.refreshEnhancementTimer = setTimeout(() => {
+        this.refreshEnhancementTimer = null;
+        const effectiveDelay = this.pendingRefreshDelay;
+        this.pendingRefreshDelay = 250;
+        void this.runRefreshEnhancement(effectiveDelay).then(() => resolve());
+      }, Math.max(delay, 180));
+    });
+  }
+
+  private runRefreshEnhancement(delay: number = 250): Promise<void> {
     try {
       const installed = getInstalledNexusMods(this.props.api);
       const config = this.buildEnhancerConfig();
       logEnhancerInfo('refreshEnhancement', {
+        tabActive: this.state.tabActive,
         installedCount: installed.size,
         hideInstalled: config.hideInstalled,
         onlyInstalled: config.onlyInstalled,
@@ -536,10 +689,93 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
         trackedCount: Object.keys(config.tracked || {}).length,
         downloadingCount: Object.keys(config.downloading || {}).length,
       });
-      this.bridge.scheduleInject(config, delay);
+      return this.bridge.scheduleInject(config, delay).then(() => {
+        if (this.state.tabActive) {
+          return this.bridge.setTabActive(true);
+        }
+        return undefined;
+      });
     } catch (err) {
       logEnhancerError('refreshEnhancement', err);
+      return Promise.resolve();
     }
+  }
+
+  private activateBrowseEnhancement(delay: number = 0): Promise<void> {
+    return this.refreshEnhancement(delay);
+  }
+
+  private scheduleFilteredBrowseRefresh(force: boolean = false) {
+    const now = Date.now();
+    const minInterval = force ? 2200 : 4500;
+    if (now - this.lastFilteredBrowseRefreshAt < minInterval) {
+      if (!this.filteredBrowseRefreshPending) {
+        this.filteredBrowseRefreshPending = true;
+        const waitMs = minInterval - (now - this.lastFilteredBrowseRefreshAt) + 50;
+        setTimeout(() => {
+          this.filteredBrowseRefreshPending = false;
+          this.scheduleFilteredBrowseRefresh(true);
+        }, waitMs);
+      }
+      return;
+    }
+    this.lastFilteredBrowseRefreshAt = now;
+    this.filteredBrowseRefreshGen += 1;
+    const gen = this.filteredBrowseRefreshGen;
+    if (!this.state.domFilterBrowseActive) {
+      this.setState({ domFilterBrowseActive: true });
+    }
+    logEnhancerInfo('scheduleFilteredBrowseRefresh', { force, gen });
+    setTimeout(() => {
+      if (gen !== this.filteredBrowseRefreshGen) {
+        return;
+      }
+      void this.refreshEnhancement(150);
+      this.bridge.scheduleBrowseContextFinalize(350);
+    }, force ? 80 : 400);
+  }
+
+  private ensureBrowseEnhancementBootstrap(reason: string) {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const src = webview && webview.src
+      ? String(webview.src)
+      : (this.webView.currentUrl || this.state.webviewSrc);
+    if (!src || src.indexOf('nexusmods.com') < 0 || src.indexOf('/mods') < 0) {
+      return;
+    }
+    const bootstrapKey = this.normalizeBrowseUrl(src);
+    const filterSessionKey = getBrowseSessionKey(src);
+    const filterActive = urlHasActiveNexusFilters(src);
+    const filterBrowseTransition = filterActive &&
+      filterSessionKey !== this.lastBrowseFilterSessionKey;
+    if (!filterActive &&
+        !filterBrowseTransition &&
+        bootstrapKey === this.lastBootstrapSrcKey &&
+        Date.now() - this.lastBootstrapAt < 1800) {
+      return;
+    }
+    this.lastBootstrapSrcKey = bootstrapKey;
+    this.lastBootstrapAt = Date.now();
+    this.lastBrowseFilterSessionKey = filterSessionKey;
+    logEnhancerInfo('ensureBrowseEnhancementBootstrap', {
+      reason,
+      src,
+      tabActive: this.state.tabActive,
+      filterActive,
+      filterBrowseTransition,
+    });
+    if (filterActive) {
+      if (filterBrowseTransition) {
+        this.scheduleFilteredBrowseRefresh(true);
+      }
+      if (!this.browseEnhancementInjected) {
+        this.scheduleBrowseEnhancementBootstrap(src, 120);
+      } else {
+        void this.refreshEnhancement(filterBrowseTransition ? 150 : 80);
+      }
+      return;
+    }
+    this.scheduleBrowseEnhancementBootstrap(src, 120);
   }
 
   handleBridgeMessage = async (message: string) => {
@@ -578,9 +814,6 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       this.lastVisibleModIds = payload.modIds;
       this.scheduleDependencyFetch(payload.modIds);
       this.scheduleViewerStateFetch(payload.modIds);
-      if (!this.state.onlyTracked && !this.state.onlyInstalled) {
-        this.refreshEnhancement(50);
-      }
     }
 
     if (payload.type === 'track-state') {
@@ -591,7 +824,8 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       }), () => {
         this.syncCatalogCacheAfterTrackedChange(this.state.trackedModIds);
         void this.prefetchTrackedCatalogTiles();
-        this.refreshEnhancement(this.state.onlyTracked ? 0 : 50);
+        const filteredBrowse = urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '');
+        this.refreshEnhancement(filteredBrowse ? 80 : (this.state.onlyTracked ? 0 : 50));
       });
     }
 
@@ -606,10 +840,11 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
           viewerDownloadedModIds: Object.assign({}, prev.viewerDownloadedModIds, payload.downloaded || {}),
         };
       }, () => {
+        const filteredBrowse = urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '');
         if (this.state.onlyTracked || this.state.onlyInstalled) {
           this.refreshEnhancement(0);
         } else {
-          this.refreshEnhancement(50);
+          this.refreshEnhancement(filteredBrowse ? 80 : 50);
         }
       });
     }
@@ -624,7 +859,8 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
         }
         this.syncCatalogCacheAfterTrackedChange(this.state.trackedModIds);
         void this.prefetchTrackedCatalogTiles();
-        this.refreshEnhancement(this.state.onlyTracked ? 0 : 10);
+        const filteredBrowse = urlHasActiveNexusFilters(this.getCurrentBrowseHref() || '');
+        this.refreshEnhancement(filteredBrowse ? 120 : (this.state.onlyTracked ? 0 : 10));
       });
     }
 
@@ -688,7 +924,32 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     }
 
     if (payload.type === 'browse-navigate') {
-      this.handleBrowseNavigate(payload.url);
+      this.handleBrowseNavigate(payload.url, payload.syncOnly);
+      return;
+    }
+
+    if (payload.type === 'filter-browse-state') {
+      if (this.state.domFilterBrowseActive !== payload.active) {
+        this.setState({ domFilterBrowseActive: payload.active }, () => {
+          if (payload.active) {
+            this.scheduleFilteredBrowseRefresh(true);
+          } else {
+            this.refreshEnhancement(80);
+          }
+        });
+      }
+      return;
+    }
+
+    if (payload.type === 'enhancer-log') {
+      appendWebviewTrace(String(payload.message || ''), payload.detail);
+      if (payload.level === 'error') {
+        logEnhancerError(`[webview] ${payload.message}`, null, payload.detail);
+      } else if (String(payload.message || '').indexOf('trace:') === 0 ||
+          String(payload.message || '').indexOf('advance') >= 0) {
+        logEnhancerInfo(`[webview] ${payload.message}`, payload.detail);
+      }
+      return;
     }
   }
 
@@ -699,20 +960,144 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     }
   }
 
-  onWebviewFinishLoad = () => {
-    const webview = this.webView.ref && this.webView.ref.mNode;
-    const src = webview && webview.src ? webview.src : this.webView.currentUrl;
+  private scheduleBrowseEnhancementBootstrap(src: string, delay: number = 400) {
     if (!src || src.indexOf('nexusmods.com') < 0 || src.indexOf('/mods') < 0) {
       return;
     }
 
-    this.bridge.resetBootstrap();
-    this.rememberCurrentWebviewUrl(src);
-    if (this.state.onlyTracked && Object.keys(this.state.trackedModIds).length === 0) {
-      void this.loadTrackedModIds();
+    const bootstrapKey = this.normalizeBrowseUrl(src);
+    if (this.browseEnhancementBootstrapTimer &&
+        this.browseEnhancementBootstrapKey === bootstrapKey) {
+      return;
     }
-    this.refreshEnhancement(400);
-    setTimeout(() => this.refreshEnhancement(200), 1800);
+    this.browseEnhancementBootstrapKey = bootstrapKey;
+    this.initialBrowseEnhancementDone = true;
+
+    if (this.browseEnhancementBootstrapTimer) {
+      clearTimeout(this.browseEnhancementBootstrapTimer);
+      this.browseEnhancementBootstrapTimer = null;
+    }
+    this.browseEnhancementBootstrapTimer = setTimeout(() => {
+      this.browseEnhancementBootstrapTimer = null;
+      void this.bridge.probeEnhancer().then((exists) => {
+        if (exists) {
+          this.browseEnhancementInjected = true;
+        }
+        return this.activateBrowseEnhancement(0).then(() => {
+          this.browseEnhancementInjected = true;
+        });
+      }).catch(() => undefined);
+    }, delay);
+  }
+
+  private normalizeBrowseUrl(url: string): string {
+    if (!url) {
+      return '';
+    }
+    try {
+      const parsed = new URL(url);
+      parsed.hash = '';
+      parsed.searchParams.delete('_vortex_reload');
+      parsed.searchParams.delete('excludedTag');
+      parsed.searchParams.sort();
+      return parsed.origin + parsed.pathname + parsed.search;
+    } catch (err) {
+      return url;
+    }
+  }
+
+  onWebviewFinishLoad = () => {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const src = webview && webview.src ? webview.src : this.webView.currentUrl;
+    if (!src || src.indexOf('nexusmods.com') < 0) {
+      return;
+    }
+
+    if (this.handleNexusAuthPage('finish-load')) {
+      this.rememberCurrentWebviewUrl(src);
+      return;
+    }
+
+    if (src.indexOf('/mods') < 0) {
+      return;
+    }
+
+    const finishKey = this.normalizeBrowseUrl(src);
+    let pathKey = finishKey;
+    try {
+      pathKey = new URL(src).pathname;
+    } catch (errPath) {
+      pathKey = finishKey;
+    }
+    const duplicatePathLoad = this.lastBrowseFinishPathKey === pathKey &&
+      Date.now() - this.lastBrowseFinishLoadAt < 15000;
+
+    this.rememberCurrentWebviewUrl(src);
+    if (!duplicatePathLoad) {
+      this.lastBrowseFinishLoadKey = finishKey;
+      this.lastBrowseFinishPathKey = pathKey;
+      this.lastBrowseFinishLoadAt = Date.now();
+      if (!this.initialBrowseEnhancementDone) {
+        this.suppressNavigationEnhancementUntil = Date.now() + 8000;
+      }
+      if (!this.browseGameMatchVerified) {
+        this.browseGameMatchVerified = true;
+        const expected = this.getGame();
+        if (!urlsMatchGame(src, expected)) {
+          this.ensureWebviewMatchesActiveGame();
+          return;
+        }
+      }
+      if (this.state.onlyTracked && Object.keys(this.state.trackedModIds).length === 0) {
+        void this.loadTrackedModIds();
+      }
+    }
+
+    const filterTransitionRecent = urlHasActiveNexusFilters(src) &&
+      Date.now() - this.lastFilterTransitionAt < 10000;
+    const probeOops = filterTransitionRecent
+      ? Promise.resolve(false)
+      : this.probeBrowseOopsPage();
+
+    void probeOops.then((oops) => {
+      if (oops) {
+        this.recoverFromBrowseOops(src);
+        return;
+      }
+
+      this.updateNexusWebLoginState('finish-load');
+
+      const refreshDelay = duplicatePathLoad ? 650 : 250;
+
+      if (duplicatePathLoad && (this.browseEnhancementInjected || this.browseEnhancementBootstrapTimer)) {
+        void this.bridge.probeEnhancer().then((exists) => {
+          if (!exists) {
+            this.browseEnhancementInjected = false;
+            this.scheduleBrowseEnhancementBootstrap(src, 450);
+            return;
+          }
+          void this.refreshEnhancement(refreshDelay);
+          this.bridge.scheduleBrowseContextFinalize(1400);
+        });
+        return;
+      }
+
+      if (this.browseEnhancementInjected) {
+        void this.bridge.probeEnhancer().then((exists) => {
+          if (!exists) {
+            this.browseEnhancementInjected = false;
+            this.scheduleBrowseEnhancementBootstrap(src, 120);
+            return;
+          }
+          void this.refreshEnhancement(refreshDelay);
+          this.bridge.scheduleBrowseContextFinalize(1400);
+        });
+        return;
+      }
+
+      const bootstrapDelay = duplicatePathLoad ? 450 : 200;
+      this.scheduleBrowseEnhancementBootstrap(src, bootstrapDelay);
+    });
   }
 
   onWebviewDomReady = () => {
@@ -720,14 +1105,22 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       return;
     }
 
-    const src = this.webView.ref.mNode.src;
+    const src = this.webView.ref.mNode.src ? String(this.webView.ref.mNode.src) : '';
+    if (this.isWebviewBootstrapUrl(src)) {
+      this.bridge.setWebview(this.webView.ref.mNode);
+      return;
+    }
+
     if (src.includes("nexusmods.com/")) {
       this.webView.currentUrl = src;
       rememberBrowseUrl(src);
       this.bridge.setWebview(this.webView.ref.mNode);
-      this.bridge.resetBootstrap();
-      this.refreshEnhancement(100);
-      setTimeout(() => this.refreshEnhancement(200), 1500);
+      if (this.handleNexusAuthPage('dom-ready')) {
+        return;
+      }
+      if (src.indexOf('/mods') >= 0) {
+        this.ensureBrowseEnhancementBootstrap('dom-ready');
+      }
       if (this.shouldApplyDefaultFilters) {
         this.shouldApplyDefaultFilters = false;
       }
@@ -752,6 +1145,44 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     }
   }
 
+  private isBrowsePaginationOnlyChange(previousUrl: string, nextUrl: string): boolean {
+    if (!previousUrl || !nextUrl || previousUrl === nextUrl) {
+      return false;
+    }
+
+    try {
+      const previous = new URL(previousUrl);
+      const next = new URL(nextUrl);
+      if (previous.origin !== next.origin || previous.pathname !== next.pathname) {
+        return false;
+      }
+      const paginationKeys: Record<string, boolean> = {
+        page: true,
+        p: true,
+        offset: true,
+        count: true,
+      };
+      const allKeys: Record<string, boolean> = {};
+      previous.searchParams.forEach((_, key) => {
+        allKeys[key] = true;
+      });
+      next.searchParams.forEach((_, key) => {
+        allKeys[key] = true;
+      });
+      for (const key of Object.keys(allKeys)) {
+        if (paginationKeys[key]) {
+          continue;
+        }
+        if (previous.searchParams.getAll(key).join('\u0001') !== next.searchParams.getAll(key).join('\u0001')) {
+          return false;
+        }
+      }
+      return previous.search !== next.search;
+    } catch (err) {
+      return false;
+    }
+  }
+
   private rememberCurrentWebviewUrl(url: string) {
     if (!url) {
       return;
@@ -761,22 +1192,91 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
   }
 
   private scheduleBrowseEnhancementAfterNavigation(baseDelay: number = 1200) {
-    this.bridge.resetBootstrap();
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    const nextUrl = webview && webview.src ? String(webview.src) : this.webView.currentUrl;
+    const previousUrl = this.webView.currentUrl || '';
+    const queryOnly = this.isBrowseQueryOnlyChange(previousUrl, nextUrl) ||
+      this.normalizeBrowseUrl(previousUrl) === this.normalizeBrowseUrl(nextUrl || '');
+    const delay = queryOnly ? Math.max(baseDelay, 1600) : baseDelay;
+
     if (this.browseEnhancementTimer) {
       clearTimeout(this.browseEnhancementTimer);
       this.browseEnhancementTimer = null;
     }
 
-    const retryDelays = [baseDelay, baseDelay + 1400, baseDelay + 3200];
-    retryDelays.forEach((delay) => {
-      setTimeout(() => {
-        this.bridge.finalizeBrowseContext().catch(() => undefined);
-        this.refreshEnhancement(250);
-      }, delay);
-    });
+    this.browseEnhancementTimer = setTimeout(() => {
+      this.browseEnhancementTimer = null;
+      if (Date.now() < this.suppressNavigationEnhancementUntil) {
+        this.scheduleBrowseEnhancementAfterNavigation(Math.max(delay, 800));
+        return;
+      }
+      if (queryOnly) {
+        const filteredBrowse = urlHasActiveNexusFilters(nextUrl || '');
+        const paginationOnly = this.isBrowsePaginationOnlyChange(previousUrl, nextUrl || '');
+        if (paginationOnly) {
+          return;
+        }
+        if (!filteredBrowse) {
+          void this.refreshEnhancement(350);
+          this.bridge.scheduleBrowseContextFinalize(1200);
+        }
+        return;
+      }
+      this.bridge.resetBootstrap();
+      void this.refreshEnhancement(250);
+    }, delay);
   }
 
-  private handleBrowseNavigate(url: string) {
+  private probeBrowseOopsPage(): Promise<boolean> {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    if (!webview || typeof webview.executeJavaScript !== 'function') {
+      return Promise.resolve(false);
+    }
+    const script = [
+      '(function(){',
+      'var text = (document.body && document.body.textContent || "").replace(/\\s+/g, " ").trim();',
+      'return /oops!? something went wrong|something went wrong|unexpected error|try again later|page could not be loaded/i.test(text);',
+      '})();',
+    ].join('');
+    return webview.executeJavaScript(script, false).then((result: any) => !!result).catch(() => false);
+  }
+
+  private recoverFromBrowseOops(url: string) {
+    const webview = this.webView.ref && this.webView.ref.mNode;
+    if (!webview || !url) {
+      return;
+    }
+
+    let recoveryUrl = url;
+    const filterActive = urlHasActiveNexusFilters(url);
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.delete('_vortex_reload');
+      if (!filterActive) {
+        parsed.searchParams.set('_vortex_reload', String(Date.now()));
+      }
+      recoveryUrl = parsed.href;
+    } catch (err) {
+      recoveryUrl = url;
+    }
+
+    logEnhancerInfo('browse oops recovery reload', { url: recoveryUrl, filterActive });
+    this.bridge.resetBootstrap();
+    this.browseEnhancementInjected = false;
+    this.rememberCurrentWebviewUrl(recoveryUrl);
+    this.suppressNavigationEnhancementUntil = Date.now() + 6000;
+    if (filterActive && typeof webview.executeJavaScript === 'function') {
+      const script = `(function(){try{window.location.replace(${JSON.stringify(recoveryUrl)});}catch(e){window.location.href=${JSON.stringify(recoveryUrl)};}})();`;
+      webview.executeJavaScript(script).catch(() => {
+        webview.src = recoveryUrl;
+      });
+    } else {
+      webview.src = recoveryUrl;
+    }
+    this.scheduleBrowseEnhancementBootstrap(recoveryUrl, 1800);
+  }
+
+  private handleBrowseNavigate(url: string, syncOnly: boolean = false) {
     const webview = this.webView.ref && this.webView.ref.mNode;
     if (!webview || !url) {
       return;
@@ -787,9 +1287,6 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       return;
     }
 
-    logEnhancerInfo('browse-navigate requested', { url });
-    this.bridge.resetBootstrap();
-
     let displayUrl = url;
     try {
       const parsed = new URL(url);
@@ -798,29 +1295,112 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     } catch (err) {
       displayUrl = url;
     }
-    this.rememberCurrentWebviewUrl(displayUrl);
 
     const previousUrl = this.webView.currentUrl || (webview.src ? String(webview.src) : '');
-    const queryOnly = this.isBrowseQueryOnlyChange(previousUrl, url);
+    const queryOnly = this.isBrowseQueryOnlyChange(previousUrl, url) ||
+      this.normalizeBrowseUrl(previousUrl) === this.normalizeBrowseUrl(displayUrl);
+    const navKey = this.normalizeBrowseUrl(displayUrl);
 
-    if (queryOnly && typeof webview.executeJavaScript === 'function') {
-      const script = `window.location.replace(${JSON.stringify(url)});`;
-      webview.executeJavaScript(script).catch(() => {
-        webview.src = url;
-      });
-    } else {
-      webview.src = url;
+    if (!syncOnly) {
+      if (navKey === this.lastBrowseNavigateKey && Date.now() - this.lastBrowseNavigateAt < 3000) {
+        return;
+      }
+      this.lastBrowseNavigateKey = navKey;
+      this.lastBrowseNavigateAt = Date.now();
+      logEnhancerInfo('browse-navigate requested', { url: displayUrl, queryOnly });
     }
 
-    this.scheduleBrowseEnhancementAfterNavigation(1500);
+    if (queryOnly || syncOnly) {
+      this.rememberCurrentWebviewUrl(displayUrl);
+      this.lastBrowseFilterSessionKey = getBrowseSessionKey(displayUrl);
+      const paginationOnly = this.isBrowsePaginationOnlyChange(previousUrl, displayUrl);
+      if (syncOnly && paginationOnly) {
+        this.suppressNavigationEnhancementUntil = Date.now() + 6000;
+        const currentSrc = webview.src ? String(webview.src) : '';
+        if (this.normalizeBrowseUrl(currentSrc) !== this.normalizeBrowseUrl(displayUrl)) {
+          if (typeof webview.executeJavaScript === 'function') {
+            const script = `(function(){try{window.location.replace(${JSON.stringify(displayUrl)});}catch(e){window.location.href=${JSON.stringify(displayUrl)};}})();`;
+            webview.executeJavaScript(script).catch(() => {
+              webview.src = displayUrl;
+            });
+          } else {
+            webview.src = displayUrl;
+          }
+        }
+        return;
+      }
+      this.suppressNavigationEnhancementUntil = Date.now() + 2500;
+      const filterActive = urlHasActiveNexusFilters(displayUrl);
+      if (filterActive && !paginationOnly) {
+        this.lastFilterTransitionAt = Date.now();
+        this.scheduleFilteredBrowseRefresh(true);
+      }
+      if (!syncOnly && !(queryOnly && filterActive)) {
+        const currentSrc = webview.src ? String(webview.src) : '';
+        if (this.normalizeBrowseUrl(currentSrc) !== this.normalizeBrowseUrl(displayUrl)) {
+          if (typeof webview.executeJavaScript === 'function') {
+            const script = `(function(){try{window.location.replace(${JSON.stringify(displayUrl)});}catch(e){window.location.href=${JSON.stringify(displayUrl)};}})();`;
+            webview.executeJavaScript(script).catch(() => {
+              webview.src = displayUrl;
+            });
+          } else {
+            webview.src = displayUrl;
+          }
+        }
+      }
+      if (!(syncOnly && paginationOnly) && !(queryOnly && filterActive)) {
+        this.scheduleBrowseEnhancementAfterNavigation(filterActive ? 500 : 1800);
+      }
+      return;
+    }
+
+    this.browseEnhancementBootstrapKey = '';
+    this.bridge.resetBootstrap();
+    this.rememberCurrentWebviewUrl(displayUrl);
+    this.resolvedWebviewSrc = displayUrl;
+    this.setState({ webviewSrc: displayUrl });
+
+    if (Date.now() >= this.suppressNavigationEnhancementUntil) {
+      this.scheduleBrowseEnhancementAfterNavigation(1500);
+    }
   }
 
   onWebviewNavigateInPage = () => {
     const webview = this.webView.ref && this.webView.ref.mNode;
     const nextUrl = webview && webview.src ? webview.src : this.webView.currentUrl;
-    if (nextUrl) {
-      this.rememberCurrentWebviewUrl(nextUrl);
+    if (!nextUrl) {
+      return;
     }
+
+    const previousUrl = this.webView.currentUrl || '';
+    const queryOnly = this.isBrowseQueryOnlyChange(previousUrl, nextUrl) ||
+      this.normalizeBrowseUrl(previousUrl) === this.normalizeBrowseUrl(nextUrl);
+    const filterSessionChanged = getBrowseSessionKey(previousUrl) !== getBrowseSessionKey(nextUrl) &&
+      (urlHasActiveNexusFilters(nextUrl) || urlHasActiveNexusFilters(previousUrl));
+    this.rememberCurrentWebviewUrl(nextUrl);
+
+    if (filterSessionChanged) {
+      this.lastBrowseFilterSessionKey = getBrowseSessionKey(nextUrl);
+      this.lastFilterTransitionAt = Date.now();
+      this.suppressNavigationEnhancementUntil = Date.now() + 8000;
+      this.scheduleFilteredBrowseRefresh(true);
+      return;
+    }
+
+    if (queryOnly) {
+      const filteredBrowse = urlHasActiveNexusFilters(nextUrl);
+      const paginationOnly = this.isBrowsePaginationOnlyChange(previousUrl, nextUrl);
+      this.suppressNavigationEnhancementUntil = Date.now() + (filteredBrowse && paginationOnly ? 6000 : 4000);
+      if (!(filteredBrowse && paginationOnly)) {
+        this.scheduleBrowseEnhancementAfterNavigation(1500);
+      }
+      return;
+    }
+
+    if (Date.now() < this.suppressNavigationEnhancementUntil) {
+      return;
+    }
+
     this.scheduleBrowseEnhancementAfterNavigation();
   }
 
@@ -829,13 +1409,23 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     const nextUrl = webview && webview.src ? webview.src : this.webView.currentUrl;
     const previousUrl = this.webView.currentUrl || '';
     const inPage = event && event.type === 'did-navigate-in-page';
+    const queryOnly = this.isBrowseQueryOnlyChange(previousUrl, nextUrl || '') ||
+      this.normalizeBrowseUrl(previousUrl) === this.normalizeBrowseUrl(nextUrl || '');
 
     if (nextUrl) {
       this.rememberCurrentWebviewUrl(nextUrl);
     }
 
-    if (inPage || this.isBrowseQueryOnlyChange(previousUrl, nextUrl || '')) {
-      this.scheduleBrowseEnhancementAfterNavigation();
+    if (nextUrl && isNexusAuthUrl(nextUrl)) {
+      this.handleNexusAuthPage('navigate');
+      return;
+    }
+
+    if (Date.now() < this.suppressNavigationEnhancementUntil) {
+      return;
+    }
+
+    if (inPage || queryOnly) {
       return;
     }
 
@@ -863,6 +1453,7 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
 
     clearBrowseSessionIfGameMismatch(game);
     this.resolvedWebviewSrc = buildDefaultBrowseUrl(game);
+    this.browseEnhancementBootstrapKey = '';
     this.lastVisibleModIds = [];
     this.lastDependencyRequestKey = '';
     this.bridge.resetBootstrap();
@@ -877,15 +1468,13 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       viewerDownloadedModIds: {},
       downloadingModIds: {},
       trackedListLoaded: false,
+      webviewSrc: this.resolvedWebviewSrc,
     });
 
     this.loadTrackedModIds();
 
-    const webview = this.webView.ref && this.webView.ref.mNode;
-    if (webview) {
-      webview.src = this.resolvedWebviewSrc;
-      this.webView.currentUrl = this.resolvedWebviewSrc;
-    }
+    this.webView.currentUrl = this.resolvedWebviewSrc;
+    rememberBrowseUrl(this.resolvedWebviewSrc);
 
     this.refreshEnhancement(300);
   }
@@ -1163,7 +1752,8 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       if (nextActive) {
         logEnhancerInfo('Browse tab activated', { pageId });
         this.ensureWebviewLoaded();
-        setTimeout(() => this.refreshEnhancement(200), 100);
+        this.ensureBrowseEnhancementBootstrap('tab-activated');
+        void this.activateBrowseEnhancement(0);
       }
     });
   }
@@ -1171,17 +1761,41 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
   private ensureWebviewLoaded() {
     const webview = this.webView.ref && this.webView.ref.mNode;
     const src = this.getWebviewSrc();
-    if (!webview || !src) {
+    if (!src) {
       return;
     }
 
-    const current = webview.src ? String(webview.src) : '';
-    if (!current || current === 'about:blank' || current.indexOf('nexusmods.com') < 0) {
-      webview.src = src;
+    const normalizedTarget = this.normalizeBrowseUrl(src);
+    const stateSrc = this.state.webviewSrc ? this.normalizeBrowseUrl(this.state.webviewSrc) : '';
+    const liveSrc = webview && webview.src ? this.normalizeBrowseUrl(String(webview.src)) : '';
+
+    if (stateSrc !== normalizedTarget) {
+      if (liveSrc && liveSrc === normalizedTarget) {
+        this.resolvedWebviewSrc = src;
+        this.webView.currentUrl = src;
+        rememberBrowseUrl(src);
+        this.setState({ webviewSrc: src }, () => {
+          if (webview) {
+            this.bridge.setWebview(webview);
+          }
+        });
+        return;
+      }
+      this.resolvedWebviewSrc = src;
       this.webView.currentUrl = src;
       rememberBrowseUrl(src);
+      this.setState({ webviewSrc: src }, () => {
+        if (webview) {
+          this.bridge.setWebview(webview);
+        }
+      });
+      return;
+    }
+
+    this.webView.currentUrl = src;
+    rememberBrowseUrl(src);
+    if (webview) {
       this.bridge.setWebview(webview);
-      this.bridge.resetBootstrap();
     }
   }
 
@@ -1224,6 +1838,14 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
                 }}>Refresh</Button>
               </div>
             ) : null}
+            {!this.state.nexusWebLoggedIn ? (
+              <Button
+                bsStyle="primary"
+                onClick={this.openNexusWebSignIn}
+              >
+                Nexus Sign In
+              </Button>
+            ) : null}
             <Button
               bsStyle={this.state.hideSiteChrome ? 'success' : 'default'}
               onClick={this.toggleHideSiteChrome}
@@ -1239,20 +1861,21 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
           <Webview autoFocus={tabActive} ref={(webView) => {
             this.webView.ref = webView;
             if (webView && webView.mNode) {
-              this.attachWebviewListeners(webView.mNode);
-              this.bridge.setWebview(webView.mNode);
+              const nodeChanged = this.boundWebviewNode !== webView.mNode;
+              if (nodeChanged) {
+                this.boundWebviewNode = webView.mNode;
+                this.webviewListenersAttached = false;
+                this.browseEnhancementInjected = false;
+                this.attachWebviewListeners(webView.mNode);
+                this.bridge.setWebview(webView.mNode);
+                this.ensureBrowseEnhancementBootstrap('webview-ref');
+              }
             }
-          }} src={this.getWebviewSrc()} className={webviewClassName}></Webview>
+          }} partition={NEXUS_WEBVIEW_PARTITION} src={this.state.webviewSrc} className={webviewClassName}></Webview>
         </MainPage.Body>
       </MainPage>
       </div>
     );
-  }
-
-  componentDidUpdate(_prevProps: Props, prevState: BrowseViewState) {
-    if (!prevState.tabActive && this.state.tabActive) {
-      this.ensureWebviewLoaded();
-    }
   }
 
   componentDidMount() {
@@ -1262,11 +1885,12 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       if (pageId === ourId) {
         if (!this.state.tabActive) {
           this.setState({ tabActive: true }, () => {
-            this.ensureWebviewLoaded();
-            setTimeout(() => this.refreshEnhancement(200), 100);
+            this.ensureBrowseEnhancementBootstrap('show-main-page');
+            void this.activateBrowseEnhancement(0);
           });
         } else {
-          this.ensureWebviewLoaded();
+          this.ensureBrowseEnhancementBootstrap('show-main-page-active');
+          void this.activateBrowseEnhancement(0);
         }
       } else if (this.state.tabActive) {
         void this.bridge.setTabActive(false);
@@ -1274,10 +1898,11 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
       }
     };
     this.props.api.events.on('show-main-page', this.showMainPageHandler);
+    this.suppressNavigationEnhancementUntil = Date.now() + 2500;
     this.handleTabVisibilityChange();
-    setTimeout(() => this.ensureWebviewLoaded(), 0);
     if (this.webView.ref && this.webView.ref.mNode) {
       this.attachWebviewListeners(this.webView.ref.mNode);
+      this.ensureBrowseEnhancementBootstrap('mount');
     }
     this.lastKnownGameSlug = this.getGame();
     this.subscribeToModChanges();
@@ -1287,7 +1912,6 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     this.startBackgroundCatalogSync();
     setTimeout(() => {
       void this.prefetchAllCatalogTiles();
-      this.ensureWebviewMatchesActiveGame();
     }, 500);
   }
 
@@ -1305,6 +1929,10 @@ export default class BrowseView extends React.Component<Props, BrowseViewState> 
     if (this.browseEnhancementTimer) {
       clearTimeout(this.browseEnhancementTimer);
       this.browseEnhancementTimer = null;
+    }
+    if (this.browseEnhancementBootstrapTimer) {
+      clearTimeout(this.browseEnhancementBootstrapTimer);
+      this.browseEnhancementBootstrapTimer = null;
     }
     if (this.dependencyFetchTimer) {
       clearTimeout(this.dependencyFetchTimer);

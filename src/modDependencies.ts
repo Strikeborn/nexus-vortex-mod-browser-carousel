@@ -161,11 +161,16 @@ export async function fetchDependencySummaries(
   });
 
   try {
+    const batches = [];
     for (let i = 0; i < pending.length; i += BATCH_SIZE) {
-      const batch = pending.slice(i, i + BATCH_SIZE);
+      batches.push(pending.slice(i, i + BATCH_SIZE));
+    }
+    const responses = await Promise.all(batches.map((batch) => {
       const uidList = batch.map((entry) => entry.uid);
-      const response = await fetchRequirementsBatch(api, uidList);
-
+      return fetchRequirementsBatch(api, uidList);
+    }));
+    batches.forEach((batch, batchIndex) => {
+      const response = responses[batchIndex];
       batch.forEach((entry) => {
         const summary = summarizeRequirements(
           response[entry.uid],
@@ -177,7 +182,7 @@ export async function fetchDependencySummaries(
         dependencyCache.set(key, { expires: Date.now() + DEP_CACHE_MS, value: summary });
         result[String(entry.modId)] = summary;
       });
-    }
+    });
   } catch (err) {
     logEnhancerError('fetchDependencySummaries failed', err, { gameDomain });
   }

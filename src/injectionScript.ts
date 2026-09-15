@@ -42,6 +42,8 @@ export interface EnhancerConfig {
   };
   gameNumericId?: number;
   trackedListLoaded?: boolean;
+  browseHref?: string;
+  filterBrowseActive?: boolean;
 }
 
 declare const INJECTION_RUNTIME: string;
@@ -52,7 +54,7 @@ export function buildEnhancerBootstrapScript(): string {
 
 export function buildEnhancerUpdateScript(config: EnhancerConfig): string {
   const payload = JSON.stringify(config);
-  return `(function(){if(window.__vortexBrowseEnhancer){return window.__vortexBrowseEnhancer.update(${payload});}return { error: 'enhancer missing' };})();`;
+  return `(function(){try{if(window.__vortexBrowseEnhancer){return window.__vortexBrowseEnhancer.update(${payload});}return { error: 'enhancer missing' };}catch(errUpdate){return { error: String(errUpdate && errUpdate.message || errUpdate) };}})();`;
 }
 
 export function buildEnhancerProbeScript(): string {
@@ -76,10 +78,12 @@ export function buildEnhancerBrowseContextScript(config: EnhancerConfig): string
 export function buildEnhancerFinalizeBrowseScript(): string {
   return [
     '(function(){',
+    'try{',
     'if(window.__vortexBrowseEnhancer&&window.__vortexBrowseEnhancer.finalizeBrowseContextTransition){',
     'return window.__vortexBrowseEnhancer.finalizeBrowseContextTransition();',
     '}',
     'return null;',
+    '}catch(errFinalize){return { error: String(errFinalize && errFinalize.message || errFinalize) };}',
     '})();',
   ].join('');
 }

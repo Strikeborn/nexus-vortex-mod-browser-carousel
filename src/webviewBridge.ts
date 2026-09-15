@@ -10,6 +10,11 @@ import {
   EnhancerConfig,
 } from './injectionScript';
 import { logEnhancerError, logEnhancerInfo } from './logger';
+import {
+  buildNexusWebSessionProbeScript,
+  buildNexusWebSessionReleaseScript,
+  NexusWebSessionProbe,
+} from './nexusWebSession';
 
 function runWebviewScript(webview: any, script: string, context: string): Promise<any> {
   const result = webview.executeJavaScript(script, false);
@@ -29,6 +34,24 @@ export class WebviewBridge {
   private debounceTimer: any = null;
   private browseContextTimer: any = null;
   private bootstrapped = false;
+
+  private flushWebviewHostLogs(stats: any) {
+    if (!stats || !Array.isArray(stats.hostLogs)) {
+      return;
+    }
+    stats.hostLogs.forEach((entry: any) => {
+      const message = entry && entry.message ? String(entry.message) : '';
+      if (!message) {
+        return;
+      }
+      const detail = entry && entry.detail !== undefined ? entry.detail : {};
+      if (entry && entry.level === 'error') {
+        logEnhancerError(`[webview] ${message}`, null, detail);
+      } else {
+        logEnhancerInfo(`[webview] ${message}`, detail);
+      }
+    });
+  }
 
   constructor(webviewNode: any) {
     this.webview = webviewNode;
@@ -54,6 +77,8 @@ export class WebviewBridge {
         return this.bootstrap(config, `${context} (re-bootstrap)`);
       }
 
+      this.flushWebviewHostLogs(stats);
+
       this.bootstrapped = true;
       logEnhancerInfo(`${context} succeeded`, {
         installedCount: Object.keys(config.installed || {}).length,
@@ -73,6 +98,8 @@ export class WebviewBridge {
     }
 
     return runWebviewScript(this.webview, buildEnhancerInjection(config), context).then((stats: any) => {
+      this.flushWebviewHostLogs(stats);
+
       this.bootstrapped = true;
       logEnhancerInfo(`${context} succeeded`, {
         installedCount: Object.keys(config.installed || {}).length,
@@ -85,7 +112,7 @@ export class WebviewBridge {
     });
   }
 
-  inject(config: EnhancerConfig): Promise<void> {
+  inject(config: EnhancerConfig, attempt: number = 0): Promise<void> {
     if (!this.webview || typeof this.webview.executeJavaScript !== 'function') {
       logEnhancerError('inject skipped: webview.executeJavaScript unavailable');
       return Promise.resolve();
@@ -99,26 +126,37 @@ export class WebviewBridge {
 
       this.bootstrapped = false;
       return this.bootstrap(config);
+    }).catch((err) => {
+      if (attempt >= 10) {
+        logEnhancerError('inject failed after retries', err, { attempt });
+        return Promise.resolve();
+      }
+      const retryDelay = Math.min(1600, 200 + attempt * 150);
+      return new Promise<void>((resolve) => {
+        setTimeout(resolve, retryDelay);
+      }).then(() => this.inject(config, attempt + 1));
     });
   }
 
-  scheduleInject(config: EnhancerConfig, delay: number = 250): void {
+  scheduleInject(config: EnhancerConfig, delay: number = 250): Promise<void> {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
     if (delay <= 0) {
-      this.inject(config).catch((err) => {
+      return this.inject(config).catch((err) => {
         logEnhancerError('scheduleInject', err);
       });
-      return;
     }
-    this.debounceTimer = setTimeout(() => {
-      this.debounceTimer = null;
-      this.inject(config).catch((err) => {
-        logEnhancerError('scheduleInject', err);
-      });
-    }, delay);
+    return new Promise((resolve) => {
+      this.debounceTimer = setTimeout(() => {
+        this.debounceTimer = null;
+        this.inject(config).then(() => resolve()).catch((err) => {
+          logEnhancerError('scheduleInject', err);
+          resolve();
+        });
+      }, delay);
+    });
   }
 
   scheduleBrowseContextPause(): void {
@@ -155,6 +193,7 @@ export class WebviewBridge {
         buildEnhancerBrowseContextScript(config),
         'browse context update',
       ).then((stats: any) => {
+        this.flushWebviewHostLogs(stats);
         this.bootstrapped = true;
         logEnhancerInfo('browse context update succeeded', {
           installedCount: Object.keys(config.installed || {}).length,
@@ -176,6 +215,7 @@ export class WebviewBridge {
       buildEnhancerFinalizeBrowseScript(),
       'browse context finalize',
     ).then((stats: any) => {
+      this.flushWebviewHostLogs(stats);
       logEnhancerInfo('browse context finalize succeeded', { webviewStats: stats });
     }).catch((err) => {
       logEnhancerError('finalizeBrowseContext', err);
@@ -197,6 +237,55 @@ export class WebviewBridge {
 
   resetBootstrap(): void {
     this.bootstrapped = false;
+  }
+
+  probeEnhancer(): Promise<boolean> {
+    if (!this.webview || typeof this.webview.executeJavaScript !== 'function') {
+      return Promise.resolve(false);
+    }
+
+    return runWebviewScript(this.webview, buildEnhancerProbeScript(), 'enhancer probe').then((exists: any) => {
+      return !!exists;
+    }).catch(() => false);
+  }
+
+  releaseAuthPageUI(): Promise<void> {
+    if (!this.webview || typeof this.webview.executeJavaScript !== 'function') {
+      return Promise.resolve();
+    }
+
+    return runWebviewScript(
+      this.webview,
+      buildNexusWebSessionReleaseScript(),
+      'nexus auth page release',
+    ).then(() => undefined).catch((err) => {
+      logEnhancerError('releaseAuthPageUI failed', err);
+    });
+  }
+
+  probeNexusWebSession(): Promise<NexusWebSessionProbe | null> {
+    if (!this.webview || typeof this.webview.executeJavaScript !== 'function') {
+      return Promise.resolve(null);
+    }
+
+    return runWebviewScript(
+      this.webview,
+      buildNexusWebSessionProbeScript(),
+      'nexus web session probe',
+    ).then((result: any) => {
+      if (!result || typeof result !== 'object') {
+        return null;
+      }
+      const state = result.state === 'login-page' || result.state === 'error' ? result.state : 'browse';
+      return {
+        state,
+        loggedIn: !!result.loggedIn,
+        error: result.error ? String(result.error) : undefined,
+      };
+    }).catch((err) => {
+      logEnhancerError('nexus web session probe failed', err);
+      return null;
+    });
   }
 
   showToast(message: string): Promise<void> {

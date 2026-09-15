@@ -66,12 +66,25 @@ export interface GridLayoutMessage {
 export interface BrowseNavigateMessage {
   type: 'browse-navigate';
   url: string;
+  syncOnly?: boolean;
+}
+
+export interface FilterBrowseStateMessage {
+  type: 'filter-browse-state';
+  active: boolean;
 }
 
 export interface FetchModTilesMessage {
   type: 'fetch-mod-tiles';
   requestId: string;
   modIds: number[];
+}
+
+export interface EnhancerLogMessage {
+  type: 'enhancer-log';
+  level: 'info' | 'error';
+  message: string;
+  detail?: any;
 }
 
 export type BridgeMessage =
@@ -87,7 +100,9 @@ export type BridgeMessage =
   | FilterSetMessage
   | GridLayoutMessage
   | BrowseNavigateMessage
-  | FetchModTilesMessage;
+  | FilterBrowseStateMessage
+  | FetchModTilesMessage
+  | EnhancerLogMessage;
 
 export const BRIDGE_LOG_PREFIX = '__VORTEX_ENHANCE__:';
 
@@ -229,7 +244,31 @@ export function parseBridgeMessage(raw: string): BridgeMessage | null {
       if (!url || url.indexOf('nexusmods.com') < 0) {
         return null;
       }
-      return { type: 'browse-navigate', url };
+      return {
+        type: 'browse-navigate',
+        url,
+        syncOnly: !!payload.syncOnly,
+      };
+    }
+
+    if (payload.type === 'filter-browse-state') {
+      return {
+        type: 'filter-browse-state',
+        active: !!payload.active,
+      };
+    }
+
+    if (payload.type === 'enhancer-log') {
+      const message = String(payload.message || '').trim();
+      if (!message) {
+        return null;
+      }
+      return {
+        type: 'enhancer-log',
+        level: payload.level === 'error' ? 'error' : 'info',
+        message,
+        detail: payload.detail,
+      };
     }
   } catch (err) {
     return null;

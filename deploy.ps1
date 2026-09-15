@@ -83,6 +83,12 @@ function Remove-ArchivedBrowsePlugins {
 
 Push-Location $ProjectRoot
 try {
+    Write-Host "Checking injectionRuntime.js syntax..."
+    node --check (Join-Path $ProjectRoot "src\injectionRuntime.js")
+    if ($LASTEXITCODE -ne 0) {
+        throw "injectionRuntime.js syntax check failed"
+    }
+
     Write-Host "Building Mod Browser Carousel extension..."
     npm run build
     if ($LASTEXITCODE -ne 0) {

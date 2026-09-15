@@ -1,5 +1,12 @@
 (function () {
   if (window.__vortexBrowseEnhancer) {
+    if (typeof window.__vortexBrowseEnhancer.reattachDocumentHooks === 'function') {
+      try {
+        window.__vortexBrowseEnhancer.reattachDocumentHooks();
+      } catch (errReattachHooks) {
+        // ignore
+      }
+    }
     return;
   }
 
@@ -7,9 +14,92 @@
   var MARK = 'data-vortex-enhanced';
   var BRIDGE_PREFIX = '__VORTEX_ENHANCE__:';
   var GRAPHQL_URL = 'https://api-router.nexusmods.com/graphql';
-  var MOD_ID_NUMERIC = /\/mods\/(\d+)(?:\/|$|\?|#)/;
-  var MOD_ID_SLUG = /\/mods\/[^/]*-(\d+)(?:\/|$|\?|#)/;
-  var MOD_SUBPAGE = new RegExp('/mods/[^/]+/(files|images|videos|posts|bugs|logs|stats|news)(?:/|$)');
+  var DOCUMENT_HOOK_PREFIX = 'data-vortex-doc-hook-';
+
+  function vortexDocumentHookInstalled(name) {
+    return !!(document.documentElement &&
+      document.documentElement.getAttribute(DOCUMENT_HOOK_PREFIX + name) === '1');
+  }
+
+  function markVortexDocumentHook(name) {
+    if (!document.documentElement || vortexDocumentHookInstalled(name)) {
+      return false;
+    }
+    document.documentElement.setAttribute(DOCUMENT_HOOK_PREFIX + name, '1');
+    return true;
+  }
+
+  var MOD_SUBPAGE_SUFFIXES = [
+    '/files', '/images', '/videos', '/posts', '/bugs', '/logs', '/stats', '/news',
+  ];
+
+  function safeModSubpageTest(href) {
+    if (!href || href.indexOf('/mods/') < 0) {
+      return false;
+    }
+    var sample = String(href);
+    if (sample.length > 512) {
+      sample = sample.slice(0, 512);
+    }
+    try {
+      var modsPos = sample.indexOf('/mods/');
+      if (modsPos < 0) {
+        return false;
+      }
+      var afterMods = sample.slice(modsPos + 6);
+      var slashIdx = afterMods.indexOf('/');
+      if (slashIdx < 0) {
+        return false;
+      }
+      var rest = afterMods.slice(slashIdx);
+      for (var i = 0; i < MOD_SUBPAGE_SUFFIXES.length; i++) {
+        var suffix = MOD_SUBPAGE_SUFFIXES[i];
+        if (rest.indexOf(suffix) === 0) {
+          var next = rest.charAt(suffix.length);
+          if (!next || next === '/' || next === '?' || next === '#') {
+            return true;
+          }
+        }
+      }
+      return false;
+    } catch (errModSubpage) {
+      return false;
+    }
+  }
+
+  function parseModIdFromPathname(pathname) {
+    if (!pathname || pathname.indexOf('/mods/') < 0) {
+      return null;
+    }
+    var sample = String(pathname);
+    if (sample.length > 512) {
+      sample = sample.slice(0, 512);
+    }
+    var modsPos = sample.indexOf('/mods/');
+    var afterMods = sample.slice(modsPos + 6);
+    var endIdx = afterMods.length;
+    ['/', '?', '#'].forEach(function (marker) {
+      var idx = afterMods.indexOf(marker);
+      if (idx >= 0 && idx < endIdx) {
+        endIdx = idx;
+      }
+    });
+    var segment = afterMods.slice(0, endIdx);
+    if (!segment) {
+      return null;
+    }
+    if (/^\d+$/.test(segment)) {
+      return parseInt(segment, 10);
+    }
+    var dashIdx = segment.lastIndexOf('-');
+    if (dashIdx >= 0) {
+      var tail = segment.slice(dashIdx + 1);
+      if (/^\d+$/.test(tail)) {
+        return parseInt(tail, 10);
+      }
+    }
+    return null;
+  }
   var BROWSE_MODS_LIST_PATH = /^\/games\/[^/]+\/mods\/?$/;
   var BROWSE_MODS_LIST_LEGACY = /^\/[^/]+\/mods\/?$/;
 
@@ -27,10 +117,20 @@
     if (isBrowseModsListPathname(pathname)) {
       return false;
     }
-    if (MOD_SUBPAGE.test(pathname)) {
+    if (safeModSubpageTest(pathname)) {
       return true;
     }
     return !!parseModIdFromUrl(pathname);
+  }
+
+  function isNexusAuthPage() {
+    try {
+      var href = String(window.location.href || '').toLowerCase();
+      return href.indexOf('users.nexusmods.com/auth/') >= 0 ||
+        href.indexOf('users.nexusmods.com/oauth') >= 0;
+    } catch (errAuthPage) {
+      return false;
+    }
   }
 
   function sendToHost(payload) {
@@ -41,21 +141,194 @@
     }
   }
 
+  function pushHostLog(message, detail, level) {
+    if (typeof enhancer === 'undefined' || !enhancer) {
+      return;
+    }
+    enhancer.hostLogBuffer = enhancer.hostLogBuffer || [];
+    enhancer.hostLogBuffer.push({
+      t: Date.now(),
+      level: level || 'info',
+      message: String(message || ''),
+      detail: detail || {},
+    });
+    if (enhancer.hostLogBuffer.length > 100) {
+      enhancer.hostLogBuffer.splice(0, enhancer.hostLogBuffer.length - 100);
+    }
+  }
+
+  function drainHostLogBuffer() {
+    var buf = enhancer.hostLogBuffer || [];
+    enhancer.hostLogBuffer = [];
+    return buf;
+  }
+
+  function attachHostLogs(stats, config) {
+    stats = stats || emptyScanStats(config || enhancer.config || {});
+    var logs = drainHostLogBuffer();
+    if (logs.length) {
+      stats.hostLogs = logs;
+    }
+    return stats;
+  }
+
+  function sanitizeHostDetail(detail) {
+    if (!detail || typeof detail !== 'object') {
+      return {};
+    }
+    var safe = {};
+    Object.keys(detail).forEach(function (key) {
+      var value = detail[key];
+      if (value === null || value === undefined) {
+        safe[key] = value;
+        return;
+      }
+      var valueType = typeof value;
+      if (valueType === 'string' || valueType === 'number' || valueType === 'boolean') {
+        safe[key] = value;
+        return;
+      }
+      if (Array.isArray(value)) {
+        safe[key] = value.slice(0, 12).map(function (entry) {
+          if (entry === null || entry === undefined) {
+            return entry;
+          }
+          var entryType = typeof entry;
+          if (entryType === 'string' || entryType === 'number' || entryType === 'boolean') {
+            return entry;
+          }
+          return String(entry);
+        });
+      }
+    });
+    return safe;
+  }
+
+  function traceStep(step, detail) {
+    enhancer.minimalNumericScanStep = String(step || '');
+    logToHost('trace:' + String(step || ''), sanitizeHostDetail(detail || {}));
+  }
+
+  function logToHost(message, detail) {
+    pushHostLog(message, sanitizeHostDetail(detail), 'info');
+    try {
+      sendToHost({
+        type: 'enhancer-log',
+        level: 'info',
+        message: String(message || ''),
+        detail: sanitizeHostDetail(detail || {}),
+      });
+    } catch (errLogHost) {
+      // ignore
+    }
+  }
+
+  function logErrorToHost(message, detail) {
+    var safeDetail = sanitizeHostDetail(detail || {});
+    pushHostLog(message, safeDetail, 'error');
+    try {
+      sendToHost({
+        type: 'enhancer-log',
+        level: 'error',
+        message: String(message || ''),
+        detail: safeDetail,
+      });
+    } catch (errLogHostErr) {
+      // ignore
+    }
+  }
+
+  function summarizeFilteredBrowseState(config) {
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var liveTiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+    var visibleTiles = 0;
+    var installButtons = 0;
+    if (grid) {
+      visibleTiles = grid.querySelectorAll(
+        '[data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-hidden):not([data-vortex-pool-tile])'
+      ).length;
+    }
+    installButtons = document.querySelectorAll('[data-e2eid="mod-tile"] .vortex-enhanced-install').length;
+    var href = '';
+    try {
+      href = getActiveBrowseHref();
+    } catch (errHref) {
+      href = '';
+    }
+    return {
+      href: href,
+      activeFilters: isFilteredBrowseSession(config),
+      filterBrowseActive: !!(config && config.filterBrowseActive),
+      liveOnly: filteredBrowseUsesLiveCatalogOnly(),
+      lightScan: shouldUseFilteredBrowseLightScan(config),
+      liveTiles: liveTiles,
+      visibleTiles: visibleTiles,
+      installButtons: installButtons,
+      needsDecoration: gridVisibleTilesNeedDecoration(config),
+      filterApplyInFlight: !!enhancer.nexusFilterApplyInFlight,
+      globalPageIndex: enhancer.globalPageIndex || 0,
+      carouselAdvancePending: !!enhancer.carouselAdvancePending,
+    };
+  }
+
+  function sendBrowseNavigateToHost(url) {
+    return navigateBrowseUrlViaHost(url);
+  }
+
+  function stripInternalBrowseParams(href) {
+    if (!href) {
+      return href;
+    }
+    try {
+      var url = new URL(href, window.location.origin);
+      url.searchParams.delete('_vortex_reload');
+      return url.href;
+    } catch (errStrip) {
+      return href;
+    }
+  }
+
+  function navigateBrowseUrlViaHost(targetUrl, options) {
+    options = options || {};
+    if (!targetUrl || targetUrl.indexOf('nexusmods.com') < 0) {
+      return false;
+    }
+    targetUrl = stripInternalBrowseParams(targetUrl);
+    var syncOnly = !!options.syncOnly;
+    if (!syncOnly && urlHasActiveNexusFilters(targetUrl)) {
+      try {
+        var currentNav = new URL(window.location.href);
+        var targetNav = new URL(targetUrl, window.location.origin);
+        if (currentNav.origin === targetNav.origin && currentNav.pathname === targetNav.pathname) {
+          syncOnly = true;
+        }
+      } catch (errNavCompare) {
+        syncOnly = true;
+      }
+    }
+    try {
+      sendToHost({ type: 'browse-navigate', url: targetUrl, syncOnly: syncOnly });
+      return true;
+    } catch (errHostNav) {
+      if (syncOnly) {
+        return true;
+      }
+      try {
+        window.location.replace(targetUrl);
+      } catch (errReplace) {
+        window.location.href = targetUrl;
+      }
+      return true;
+    }
+  }
+
   function parseModIdFromUrl(url) {
     try {
       var pathname = new URL(url, window.location.origin).pathname;
-      var numeric = pathname.match(MOD_ID_NUMERIC);
-      if (numeric) {
-        return parseInt(numeric[1], 10);
-      }
-      var slug = pathname.match(MOD_ID_SLUG);
-      if (slug) {
-        return parseInt(slug[1], 10);
-      }
+      return parseModIdFromPathname(pathname);
     } catch (err) {
       return null;
     }
-    return null;
   }
 
   function extractModIdFromTile(tile) {
@@ -73,7 +346,7 @@
       if (!href) {
         continue;
       }
-      if (MOD_SUBPAGE.test(href)) {
+      if (safeModSubpageTest(href)) {
         continue;
       }
       var parsed = parseModIdFromUrl(href);
@@ -152,6 +425,9 @@
   }
 
   function closeOpenDropdowns() {
+    if (isUserInteractingWithNexusFilters()) {
+      return;
+    }
     try {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
     } catch (err) {
@@ -167,9 +443,24 @@
 
   function hideNexusItemsPerPageUi(options) {
     options = options || {};
+    var preservePopovers = isUserInteractingWithNexusFilters();
     var btn = findItemsPerPageButton();
     if (btn) {
-      btn.classList.add('vortex-enhanced-browse-trim-hidden');
+      btn.classList.add('vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-items-per-page-hide');
+    }
+
+    document.querySelectorAll('button[aria-label="Mods per page"], [role="combobox"]').forEach(function (node) {
+      if (node.closest && node.closest('#filters-panel, aside')) {
+        return;
+      }
+      var label = (node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (label === 'Mods per page' || /\b\d+\s*items\b/i.test(label)) {
+        node.classList.add('vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-items-per-page-hide');
+      }
+    });
+
+    if (preservePopovers) {
+      return;
     }
 
     if (options.closeDropdowns) {
@@ -177,9 +468,14 @@
     }
 
     document.querySelectorAll('[role="listbox"], [data-radix-popper-content-wrapper]').forEach(function (node) {
+      if (node.closest && node.closest('#filters-panel, aside')) {
+        return;
+      }
       var menuText = (node.textContent || '').toLowerCase();
-      if (menuText.indexOf('items') >= 0 && /\b(20|40|60|80)\b/.test(menuText)) {
-        node.classList.add('vortex-enhanced-browse-trim-hidden');
+      if (menuText.indexOf('items') >= 0 && /\b(20|40|60|80)\b/.test(menuText) &&
+          menuText.indexOf('download') < 0 && menuText.indexOf('category') < 0 &&
+          menuText.indexOf('sort') < 0) {
+        node.classList.add('vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-items-per-page-hide');
       }
     });
   }
@@ -218,7 +514,9 @@
     url.searchParams.delete('page');
     url.searchParams.set('count', String(enhancer.nexusPageSizeTarget || 80));
     url.searchParams.delete('excludedTag');
-    url.searchParams.append('excludedTag', 'Translation');
+    if (shouldApplyTranslationFilter()) {
+      url.searchParams.append('excludedTag', 'Translation');
+    }
 
     if (!sortParam) {
       url.searchParams.delete('sort');
@@ -295,6 +593,10 @@
       return false;
     }
 
+    if (shouldPreserveNexusFiltersPanel()) {
+      return false;
+    }
+
     if (shouldDeferNexusUrlMutation()) {
       return false;
     }
@@ -327,7 +629,11 @@
       return false;
     }
 
-    if (urlCount === targetSize && liveTiles < 8) {
+    if (urlCount === targetSize) {
+      enhancer.nexusPageSizePending = false;
+      if (liveTiles >= 8) {
+        hideNexusItemsPerPageUi();
+      }
       return false;
     }
 
@@ -365,6 +671,7 @@
       var text = (buttons[i].textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
       if (text.indexOf('show filters') === 0) {
         buttons[i].click();
+        markNexusFiltersPanelOpen(true, { userIntent: true });
         return true;
       }
     }
@@ -375,23 +682,18 @@
     if (enhancer.filtersPanelOpenApplied) {
       return;
     }
-    if (!isNexusFiltersPanelOpen()) {
-      openNexusFiltersPanel();
+    if (isNexusFiltersPanelOpen()) {
+      markNexusFiltersPanelOpen(true);
     }
-    var aside = findNexusFilterAside();
-    if (aside) {
-      aside.classList.add('vortex-enhanced-nexus-filters-open');
-      aside.classList.remove('vortex-enhanced-chrome-hidden');
-      aside.classList.remove('vortex-enhanced-browse-trim-hidden');
-    }
-    var filtersPanel = document.getElementById('filters-panel');
-    if (filtersPanel) {
-      filtersPanel.classList.add('vortex-enhanced-nexus-filters-open');
-      filtersPanel.classList.remove('vortex-enhanced-browse-trim-hidden');
-    }
-    if (isNexusFiltersPanelOpen() || aside || filtersPanel) {
-      enhancer.filtersPanelOpenApplied = true;
-    }
+    enhancer.filtersPanelOpenApplied = true;
+    collapseNativeNexusFilterSections(true);
+    [100, 350, 800].forEach(function (delay) {
+      setTimeout(function () {
+        if (!enhancer.nexusFilterUserInteracted) {
+          collapseNativeNexusFilterSections(true);
+        }
+      }, delay);
+    });
   }
 
   function hideNexusRewardsPromo() {
@@ -465,7 +767,6 @@
     if (!aside) {
       return;
     }
-
     var root = findNativeContentOptionsRoot();
     if (root) {
       root.querySelectorAll('[data-state="closed"]').forEach(function (el) {
@@ -524,13 +825,44 @@
     }
   }
 
-  function collapseNativeNexusFilterSections() {
+  function collapseNativeNexusFilterSections(force) {
+    if (enhancer.nexusFilterUserInteracted ||
+        (!force && (shouldPreserveNexusFiltersPanel() ||
+          enhancer.userWantsNexusFiltersOpen))) {
+      return;
+    }
     var aside = findNexusFilterAside() || document.getElementById('filters-panel');
     if (!aside) {
       return;
     }
+    traceStep('native-filter-collapse-pass', {
+      force: !!force,
+      openStates: aside.querySelectorAll('[data-state="open"]').length,
+      openDetails: aside.querySelectorAll('details[open]').length,
+      expandedButtons: aside.querySelectorAll('button[aria-expanded="true"], [role="button"][aria-expanded="true"]').length,
+      expandedLabels: Array.prototype.map.call(
+        aside.querySelectorAll('button[aria-expanded="true"], [role="button"][aria-expanded="true"]'),
+        function (btn) { return nativeNexusToggleLabel(btn); }
+      ),
+    });
 
     var contentRoot = findNativeContentOptionsRoot();
+
+    // Click toggles before changing their Radix state attributes so React
+    // receives the transition and unmounts the expanded section content.
+    aside.querySelectorAll('button[aria-expanded="true"], [role="button"][aria-expanded="true"]').forEach(function (btn) {
+      if (isEnhancedPanelToggle(btn) || shouldSkipNativeNexusToggle(btn)) {
+        return;
+      }
+      try {
+        btn.click();
+      } catch (errCollapseNativeToggle) {
+        // The attribute cleanup below is the fallback.
+      }
+      if (btn.getAttribute('aria-expanded') === 'true') {
+        btn.setAttribute('aria-expanded', 'false');
+      }
+    });
 
     aside.querySelectorAll('[data-state="open"]').forEach(function (el) {
       if (el.closest('[data-vortex-enhanced-filters="true"]')) {
@@ -559,12 +891,24 @@
       if (isEnhancedPanelToggle(btn) || shouldSkipNativeNexusToggle(btn)) {
         return;
       }
-      btn.click();
+      btn.setAttribute('aria-expanded', 'false');
+      var toggleRoot = btn.closest('[data-state], details, section, li, div[data-orientation]');
+      if (toggleRoot && toggleRoot.getAttribute('data-state') === 'open') {
+        toggleRoot.setAttribute('data-state', 'closed');
+      }
     });
 
-    expandNativeNexusContentOptions();
-    setTimeout(expandNativeNexusContentOptions, 400);
-    setTimeout(expandNativeNexusContentOptions, 1200);
+  }
+
+  function scheduleCollapseNativeNexusFilterSections() {
+    if (enhancer.nativeFilterCleanupScheduled) {
+      return;
+    }
+    enhancer.nativeFilterCleanupScheduled = true;
+    collapseNativeNexusFilterSections(true);
+    setTimeout(function () {
+      enhancer.nativeFilterCleanupScheduled = false;
+    }, 500);
   }
 
   function findItemsPerPageButton() {
@@ -588,22 +932,337 @@
     return false;
   }
 
-  function findNexusFilterAside() {
+  function isNexusFiltersPanelVisible() {
+    if (isNexusFiltersPanelOpen()) {
+      return true;
+    }
     var filtersPanel = document.getElementById('filters-panel');
-    if (filtersPanel && !filtersPanel.querySelector('[data-vortex-enhanced-filters="true"]')) {
+    if (filtersPanel && filtersPanel.classList.contains('vortex-enhanced-nexus-filters-open')) {
+      return true;
+    }
+    var aside = findNexusFilterAside();
+    if (aside && aside.classList.contains('vortex-enhanced-nexus-filters-open')) {
+      return true;
+    }
+    return false;
+  }
+
+  function nativeFilterDropdownIsOpen() {
+    var poppers = document.querySelectorAll(
+      '[data-radix-popper-content-wrapper]:not(.vortex-enhanced-items-per-page-hide), ' +
+      '[data-radix-select-content]:not(.vortex-enhanced-items-per-page-hide)'
+    );
+    for (var p = 0; p < poppers.length; p++) {
+      if (!poppers[p].querySelector('[data-state="open"]')) {
+        continue;
+      }
+      var menuText = (poppers[p].textContent || '').toLowerCase();
+      if (menuText.indexOf('items') >= 0 && /\b(20|40|60|80)\b/.test(menuText) &&
+          menuText.indexOf('download') < 0 && menuText.indexOf('category') < 0) {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  function isUserInteractingWithNexusFilters() {
+    if (enhancer.nexusFilterApplyInFlight) {
+      return true;
+    }
+    if (enhancer.nexusFilterInteractionUntil && Date.now() < enhancer.nexusFilterInteractionUntil) {
+      return true;
+    }
+    if (nativeFilterDropdownIsOpen()) {
+      return true;
+    }
+    var active = document.activeElement;
+    if (active && active.closest &&
+        active.closest('[data-radix-popper-content-wrapper], [role="listbox"], [role="dialog"]')) {
+      var popperRoot = active.closest('[data-radix-popper-content-wrapper], [role="listbox"]');
+      if (popperRoot && !popperRoot.classList.contains('vortex-enhanced-items-per-page-hide')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function shouldPreserveNexusFiltersPanel() {
+    return isUserInteractingWithNexusFilters();
+  }
+
+  function noteNexusFilterPanelInteraction() {
+    enhancer.nexusFilterInteractionUntil = Date.now() + 4000;
+  }
+
+  function prepareCarouselForNativeFilterChange() {
+    var pageIndex = enhancer.globalPageIndex || 0;
+    var pooledTiles = document.querySelectorAll('[data-vortex-pool-tile="true"]').length;
+    if (pageIndex <= 0 && pooledTiles === 0) {
+      return;
+    }
+    traceStep('native-filter-change-page-reset', {
+      page: pageIndex + 1,
+      pooledTiles: pooledTiles,
+      href: window.location.href,
+    });
+    clearCarouselQuietPeriod();
+    enhancer.carouselAdvancePending = false;
+    enhancer.carouselAdvancePendingSince = 0;
+    enhancer.filteredNexusPageNavInFlight = false;
+    enhancer.pendingNativeCatalogFetch = false;
+    enhancer.pendingPoolFetch = false;
+    enhancer.lastAppliedSliceKey = '';
+    restoreStashedLiveNexusTiles();
+    document.querySelectorAll('[data-vortex-pool-tile="true"]').forEach(function (tile) {
+      if (tile.parentElement) {
+        tile.parentElement.removeChild(tile);
+      }
+    });
+    resetGlobalPagingSoft();
+    resetFilteredCarouselCatalog();
+    unhideAllCarouselTiles();
+  }
+
+  function ensureNexusFilterInteractionCapture() {
+    if (!markVortexDocumentHook('filter-interaction-capture')) {
+      return;
+    }
+    document.addEventListener('pointerdown', function (event) {
+      var target = event.target;
+      if (!target || !target.closest) {
+        return;
+      }
+      if (target.closest('#filters-panel, aside') &&
+          !target.closest('[data-vortex-enhanced-filters="true"]')) {
+        var filterControl = target.closest(
+          'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], ' +
+          '[role="option"], [role="menuitemcheckbox"], [role="menuitemradio"]'
+        );
+        if (filterControl) {
+          prepareCarouselForNativeFilterChange();
+        }
+        enhancer.nexusFilterUserInteracted = true;
+        noteNexusFilterPanelInteraction();
+      }
+    }, true);
+    document.addEventListener('input', function (event) {
+      var target = event.target;
+      if (!target || !target.closest ||
+          !target.closest('#filters-panel, aside') ||
+          target.closest('[data-vortex-enhanced-filters="true"]')) {
+        return;
+      }
+      noteNexusFilterPanelInteraction();
+      enhancer.domFilterBrowseActive = true;
+      enhancer.filteredBrowseEngaged = true;
+      stashSidebarNumericFilters();
+    }, true);
+    document.addEventListener('change', function (event) {
+      var target = event.target;
+      if (!target || !target.closest ||
+          !target.closest('#filters-panel, aside') ||
+          target.closest('[data-vortex-enhanced-filters="true"]')) {
+        return;
+      }
+      prepareCarouselForNativeFilterChange();
+      noteNexusFilterPanelInteraction();
+      enhancer.domFilterBrowseActive = true;
+      enhancer.filteredBrowseEngaged = true;
+      stashSidebarNumericFilters();
+      if (hasSidebarDownloadsFilterApplied() || hasVisibleNexusFilterChipText()) {
+        enhancer.nexusFilterApplyInFlight = true;
+        enhancer.nexusFilterApplyStartUrl = window.location.href;
+      }
+    }, true);
+  }
+
+  function restoreNexusFilterPopovers() {
+    document.querySelectorAll(
+      '[data-radix-popper-content-wrapper].vortex-enhanced-browse-trim-hidden, ' +
+      '[role="listbox"].vortex-enhanced-browse-trim-hidden'
+    ).forEach(function (node) {
+      var menuText = (node.textContent || '').toLowerCase();
+      if (menuText.indexOf('download') >= 0 || menuText.indexOf('category') >= 0 ||
+          menuText.indexOf('tag') >= 0 || menuText.indexOf('author') >= 0 ||
+          menuText.indexOf('rating') >= 0 || menuText.indexOf('sort') >= 0) {
+        node.classList.remove('vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-items-per-page-hide');
+        if (node.style) {
+          node.style.removeProperty('display');
+        }
+      }
+    });
+  }
+
+  function markNexusFiltersPanelOpen(open, options) {
+    options = options || {};
+    var aside = findNexusFilterAside();
+    var filtersPanel = document.getElementById('filters-panel');
+    if (open) {
+      if (options.userIntent) {
+        enhancer.userWantsNexusFiltersOpen = true;
+        var cooldownMs = options.cooldownMs || 12000;
+        enhancer.nexusFilterCooldownUntil = Math.max(enhancer.nexusFilterCooldownUntil || 0, Date.now() + cooldownMs);
+      }
+      if (aside) {
+        aside.classList.add('vortex-enhanced-nexus-filters-open');
+        aside.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+        aside.style.removeProperty('display');
+      }
+      if (filtersPanel) {
+        filtersPanel.classList.add('vortex-enhanced-nexus-filters-open');
+        filtersPanel.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+        filtersPanel.style.removeProperty('display');
+      }
+      if (options.userIntent || isUserInteractingWithNexusFilters()) {
+        restoreNexusFilterPopovers();
+      }
+      return;
+    }
+    if (options.userIntent) {
+      enhancer.userWantsNexusFiltersOpen = false;
+    }
+    if (aside) {
+      aside.classList.remove('vortex-enhanced-nexus-filters-open');
+    }
+    if (filtersPanel) {
+      filtersPanel.classList.remove('vortex-enhanced-nexus-filters-open');
+    }
+  }
+
+  function ensureNexusFiltersPanelStayOpen() {
+    if (!isNexusFiltersPanelVisible()) {
+      return;
+    }
+    markNexusFiltersPanelOpen(true);
+  }
+
+  function safeApplyFilteredBrowseLiveOnlyPage(config, options) {
+    options = options || {};
+    if (enhancer.filteredBrowseLivePageInFlight) {
+      if (options.forcePageApply) {
+        setTimeout(function () {
+          safeApplyFilteredBrowseLiveOnlyPage(config, options);
+        }, 60);
+      }
+      return 0;
+    }
+    enhancer.filteredBrowseLivePageInFlight = true;
+    try {
+      return applyFilteredBrowseLiveOnlyPage(config, options);
+    } catch (errFilteredPage) {
+      try {
+        decorateVisibleFilteredCarouselTiles(config);
+      } catch (errDecorateFallback) {
+        // ignore
+      }
+      return 0;
+    } finally {
+      enhancer.filteredBrowseLivePageInFlight = false;
+    }
+  }
+
+  function startFilteredBrowseDecorationWatchdog(config) {
+    if (!config || !isFilteredBrowseSession(config)) {
+      return;
+    }
+    if (enhancer.filteredBrowseDecorateWatchdogTimer) {
+      clearInterval(enhancer.filteredBrowseDecorateWatchdogTimer);
+      enhancer.filteredBrowseDecorateWatchdogTimer = null;
+    }
+    var attempts = 0;
+    enhancer.filteredBrowseDecorateWatchdogTimer = setInterval(function () {
+      attempts++;
+      if (attempts > 12 || !isFilteredBrowseSession(config)) {
+        clearInterval(enhancer.filteredBrowseDecorateWatchdogTimer);
+        enhancer.filteredBrowseDecorateWatchdogTimer = null;
+        return;
+      }
+      var cfg = enhancer.config || config;
+      if (!cfg) {
+        return;
+      }
+      if (!gridVisibleTilesNeedDecoration(cfg)) {
+        clearInterval(enhancer.filteredBrowseDecorateWatchdogTimer);
+        enhancer.filteredBrowseDecorateWatchdogTimer = null;
+        return;
+      }
+      applyFiltersToAllGridTiles(cfg);
+      dedupeLiveGridModTiles(cfg);
+      decorateVisibleFilteredCarouselTiles(cfg);
+    }, 500);
+  }
+
+  function immediateFilteredBrowseEnhance(config, options) {
+    options = options || {};
+    if (!config || !urlHasActiveNexusFilters()) {
+      return 0;
+    }
+    if (enhancer.filteredBrowseEnhanceInFlight) {
+      return 0;
+    }
+    enhancer.filteredBrowseEnhanceInFlight = true;
+    try {
+      clearStaleFilteredBrowseFetchLocks();
+      clearCarouselQuietPeriod();
+      restoreMainBrowseContentVisibility();
+      ensureCarouselLayout(config);
+      applyFiltersToAllGridTiles(config);
+      var decorated = decorateVisibleGridTiles(config, { forceAll: true });
+      var liveCount = collectLiveGridCards(config).length;
+      if (liveCount >= 4) {
+        applyFilteredNexusDirectPage(config, { skipDecorationRetry: true });
+      } else if (liveCount > 0) {
+        decorated += decorateVisibleGridTiles(config, { forceAll: true });
+        ensureCarouselControlsBar();
+        protectBrowseControlsFromChromeHide();
+        installCarouselWheelHandler();
+        scheduleFilteredBrowseRescan(200);
+      } else {
+        ensureCarouselControlsBar();
+        protectBrowseControlsFromChromeHide();
+        installCarouselWheelHandler();
+        scheduleFilteredBrowseRescan(200);
+      }
+      ensureNexusFiltersPanelStayOpen();
+      if (!options.fromWatchdog) {
+        startFilteredBrowseDecorationWatchdog(config);
+      }
+      decorated += decorateVisibleFilteredCarouselTiles(config);
+      logToHost('immediateFilteredBrowseEnhance', {
+        decorated: decorated,
+        liveCount: liveCount,
+        browseHref: getActiveBrowseHref(),
+        state: summarizeFilteredBrowseState(config),
+      });
+      return decorated;
+    } finally {
+      enhancer.filteredBrowseEnhanceInFlight = false;
+    }
+  }
+
+  function findNexusFilterAside() {
+    var vortexPanel = document.querySelector('[data-vortex-enhanced-filters="true"]');
+    if (vortexPanel) {
+      var panelHost = vortexPanel.closest('aside, #filters-panel');
+      if (panelHost) {
+        return panelHost;
+      }
+    }
+
+    var filtersPanel = document.getElementById('filters-panel');
+    if (filtersPanel) {
       return filtersPanel;
     }
 
     var asides = document.querySelectorAll('aside');
     for (var i = 0; i < asides.length; i++) {
-      if (asides[i].querySelector('[data-vortex-enhanced-filters="true"]')) {
-        continue;
-      }
       var text = (asides[i].textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
       if (text.indexOf('categories') >= 0 ||
           text.indexOf('hide translations') >= 0 ||
           text.indexOf('language support') >= 0 ||
-          text.indexOf('tags') >= 0) {
+          text.indexOf('tags') >= 0 ||
+          text.indexOf('vortex filters') >= 0) {
         return asides[i];
       }
     }
@@ -624,18 +1283,26 @@
 
       var url = new URL(form.action);
       url.searchParams.set('count', String(enhancer.nexusPageSizeTarget || 80));
-      if (enhancer.clientHideTranslations || enhancer.forceDefaultFilters) {
+      if (shouldApplyTranslationFilter()) {
         var tags = url.searchParams.getAll('excludedTag');
         if (!tags.some(function (tag) {
           return /translation/i.test(String(tag));
         })) {
           url.searchParams.append('excludedTag', 'Translation');
         }
+      } else {
+        var keptFormTags = url.searchParams.getAll('excludedTag').filter(function (tag) {
+          return !/translation/i.test(String(tag));
+        });
+        url.searchParams.delete('excludedTag');
+        keptFormTags.forEach(function (tag) {
+          url.searchParams.append('excludedTag', tag);
+        });
       }
       url.searchParams.delete('page');
       url.searchParams.delete('offset');
       url.searchParams.delete('_vortex_reload');
-      return url.href;
+      return finalizeNexusFilterApplyUrl(url.href);
     } catch (errFormUrl) {
       return '';
     }
@@ -683,13 +1350,30 @@
   }
 
   function syncNexusFiltersState(config) {
-    var open = isNexusFiltersPanelOpen();
+    var preserveDropdowns = shouldPreserveNexusFiltersPanel();
+    var open = isNexusFiltersPanelVisible();
     var aside = findNexusFilterAside();
+    var filtersPanel = document.getElementById('filters-panel');
 
     if (aside) {
-      aside.classList.toggle('vortex-enhanced-nexus-filters-open', open);
-      aside.classList.remove('vortex-enhanced-chrome-hidden');
-      aside.classList.remove('vortex-enhanced-browse-trim-hidden');
+      if (open) {
+        aside.classList.add('vortex-enhanced-nexus-filters-open');
+        aside.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+        if (aside.style) {
+          aside.style.removeProperty('display');
+        }
+      } else {
+        aside.classList.remove('vortex-enhanced-nexus-filters-open');
+      }
+    }
+    if (filtersPanel) {
+      if (open) {
+        filtersPanel.classList.add('vortex-enhanced-nexus-filters-open');
+        filtersPanel.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+        if (filtersPanel.style) {
+          filtersPanel.style.removeProperty('display');
+        }
+      }
     }
 
     var panel = document.querySelector('[data-vortex-enhanced-filters="true"]');
@@ -713,7 +1397,10 @@
     }
 
     applyDefaultFilterSectionState();
-    collapseNativeNexusFilterSections();
+    if (config) {
+      ensureVortexFilterPanel(config);
+    }
+    protectNexusActiveFiltersRow();
   }
 
   function formatResultsCount(value) {
@@ -779,10 +1466,43 @@
     return getTrackedCatalogModIds(config).length;
   }
 
+  function resetNexusResultsHeadlineCache() {
+    document.querySelectorAll('[data-vortex-results-headline="true"]').forEach(function (node) {
+      var original = node.getAttribute('data-vortex-results-original');
+      if (original) {
+        node.textContent = original;
+      }
+      node.removeAttribute('data-vortex-results-headline');
+      node.removeAttribute('data-vortex-results-original');
+    });
+    enhancer.nexusCatalogTotal = 0;
+    enhancer.nexusResultsHeadlineKey = '';
+  }
+
   function syncNexusResultsHeadline(config) {
     if (!config) {
       return;
     }
+
+    if (isNexusFilteredBrowse()) {
+      return;
+    }
+
+    var shouldOverride = isLocalCatalogMode(config) || hasClientCarouselFilters(config);
+    if (!shouldOverride) {
+      resetNexusResultsHeadlineCache();
+      return;
+    }
+
+    var headlineKey = getBrowseSessionKey() + '|' +
+      (config.hideInstalled ? 'hi' : '') +
+      (config.onlyInstalled ? 'oi' : '') +
+      (config.hideTracked ? 'ht' : '') +
+      (config.onlyTracked ? 'ot' : '');
+    if (enhancer.nexusResultsHeadlineKey && enhancer.nexusResultsHeadlineKey !== headlineKey) {
+      resetNexusResultsHeadlineCache();
+    }
+    enhancer.nexusResultsHeadlineKey = headlineKey;
 
     var nodes = document.querySelectorAll('span, div, p, strong');
     for (var i = 0; i < nodes.length; i++) {
@@ -808,19 +1528,1055 @@
       }
 
       var effective = getEffectiveResultsTotal(config, 0);
-
-      var useMatching = hasClientCarouselFilters(config) ||
-        (isLocalCatalogMode(config) && (hasLocalCatalogData(config) || isOnlyTrackedLivePreview(config)));
-      if (useMatching && effective > 0) {
+      if (effective > 0) {
         node.textContent = formatResultsCount(effective) + ' results';
-      } else {
-        var original = node.getAttribute('data-vortex-results-original');
-        if (original) {
-          node.textContent = original.replace(/\smatching$/i, ' results');
-        }
       }
       return;
     }
+  }
+
+  function isResultsCountHeadlineNode(node) {
+    if (!node || node.nodeType !== 1) {
+      return false;
+    }
+    var text = normalizeCountScanText(node.textContent || '');
+    if (!/^[\d][\d,]*\s+(?:results|matching)$/i.test(text)) {
+      return false;
+    }
+    if (node.children && node.children.length > 0) {
+      for (var c = 0; c < node.children.length; c++) {
+        var childText = normalizeCountScanText(node.children[c].textContent || '');
+        if (/^[\d][\d,]*\s+(?:results|matching)$/i.test(childText)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function hasDomNexusMatchingHeadline() {
+    var roots = [
+      document.getElementById('mainContent'),
+      document.querySelector('[class*="ResultsHeader"]'),
+      document.querySelector('main'),
+    ];
+    var seenRoot = {};
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      if (!root || seenRoot[root]) {
+        continue;
+      }
+      seenRoot[root] = true;
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var textNode;
+      while ((textNode = walker.nextNode())) {
+        if (textNode.parentElement &&
+            textNode.parentElement.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+          continue;
+        }
+        var matchingChunk = normalizeCountScanText(textNode.textContent || '');
+        if (matchingChunk && safeMatchCountLabel(matchingChunk, 'matching')) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function hasVisibleNexusFilterChipText() {
+    var rows = document.querySelectorAll('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]');
+    for (var i = 0; i < rows.length; i++) {
+      var text = normalizeUiText(rows[i].textContent || '');
+      if (/max downloads:\s*[\d,]+/i.test(text) ||
+          /min downloads:\s*[\d,]+/i.test(text) ||
+          (/^excluded:/i.test(text) && !/^excluded:\s*translation$/i.test(text))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function hasSidebarDownloadsFilterApplied() {
+    var panel = document.getElementById('filters-panel') || findNexusFilterAside();
+    if (!panel) {
+      return false;
+    }
+    var inputs = panel.querySelectorAll('input');
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input || input.type === 'checkbox' || input.type === 'radio') {
+        continue;
+      }
+      var rowText = '';
+      var row = input.closest('section, fieldset, label, div');
+      if (row) {
+        rowText = normalizeUiText(row.textContent || '').slice(0, 120);
+      }
+      var name = normalizeUiText(input.getAttribute('name') || input.getAttribute('aria-label') || '');
+      if (!/download/i.test(rowText) && !/download/i.test(name)) {
+        continue;
+      }
+      var raw = normalizeUiText(input.value || '').replace(/,/g, '');
+      if (!raw) {
+        continue;
+      }
+      var parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function findModsListingTotalInObject(obj, depth, best) {
+    depth = depth || 0;
+    best = best || { score: 0, total: null };
+    if (!obj || depth > 22) {
+      return best;
+    }
+    if (typeof obj.totalCount === 'number' && obj.totalCount > 0 && Array.isArray(obj.nodes)) {
+      var nodeScore = 2 + (obj.nodes.length > 0 ? 2 : 0);
+      if (nodeScore >= best.score) {
+        best.score = nodeScore;
+        best.total = obj.totalCount;
+      }
+    }
+    if (obj.mods && typeof obj.mods.totalCount === 'number' && obj.mods.totalCount > 0) {
+      if (3 >= best.score) {
+        best.score = 3;
+        best.total = obj.mods.totalCount;
+      }
+    }
+    if (typeof obj.matchingCount === 'number' && obj.matchingCount > 0) {
+      if (5 >= best.score) {
+        best.score = 5;
+        best.total = obj.matchingCount;
+      }
+    }
+    if (typeof obj.filteredCount === 'number' && obj.filteredCount > 0) {
+      if (4 >= best.score) {
+        best.score = 4;
+        best.total = obj.filteredCount;
+      }
+    }
+    if (Array.isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+        findModsListingTotalInObject(obj[i], depth + 1, best);
+      }
+      return best;
+    }
+    if (typeof obj === 'object') {
+      var keys = Object.keys(obj);
+      for (var k = 0; k < keys.length; k++) {
+        findModsListingTotalInObject(obj[keys[k]], depth + 1, best);
+      }
+    }
+    return best;
+  }
+
+  function collectNexusListingTotalsInObject(obj, depth, totals) {
+    depth = depth || 0;
+    totals = totals || { resultsTotal: null, matchingTotal: null };
+    if (!obj || depth > 22) {
+      return totals;
+    }
+    if (typeof obj.totalCount === 'number' && obj.totalCount > 0) {
+      if (Array.isArray(obj.nodes)) {
+        if (!totals.resultsTotal || obj.totalCount < totals.resultsTotal) {
+          totals.resultsTotal = obj.totalCount;
+        }
+      }
+    }
+    if (obj.mods && typeof obj.mods.totalCount === 'number' && obj.mods.totalCount > 0) {
+      if (!totals.resultsTotal || obj.mods.totalCount < totals.resultsTotal) {
+        totals.resultsTotal = obj.mods.totalCount;
+      }
+    }
+    if (typeof obj.filteredCount === 'number' && obj.filteredCount > 0) {
+      if (!totals.resultsTotal || obj.filteredCount < totals.resultsTotal) {
+        totals.resultsTotal = obj.filteredCount;
+      }
+    }
+    if (typeof obj.matchingCount === 'number' && obj.matchingCount > 0) {
+      if (!totals.matchingTotal || obj.matchingCount > totals.matchingTotal) {
+        totals.matchingTotal = obj.matchingCount;
+      }
+    }
+    if (Array.isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+        collectNexusListingTotalsInObject(obj[i], depth + 1, totals);
+      }
+      return totals;
+    }
+    if (typeof obj === 'object') {
+      var keys = Object.keys(obj);
+      for (var k = 0; k < keys.length; k++) {
+        collectNexusListingTotalsInObject(obj[keys[k]], depth + 1, totals);
+      }
+    }
+    return totals;
+  }
+
+  function readNexusFilterTotalsFromNextData() {
+    var root = readNextDataRoot();
+    if (!root) {
+      return { resultsTotal: null, matchingTotal: null };
+    }
+    return collectNexusListingTotalsInObject(root, 0, { resultsTotal: null, matchingTotal: null });
+  }
+
+  function readNexusFilteredTotalFromNextData() {
+    var totals = readNexusFilterTotalsFromNextData();
+    return resolveFilteredBrowseDisplayTotal(totals.resultsTotal || 0, totals.matchingTotal || 0) || null;
+  }
+
+  function hasNonDefaultNexusFilterChip() {
+    var found = false;
+    forEachActiveNexusFilterChip(function (chip) {
+      var text = normalizeUiText(chip.textContent || '');
+      var aria = normalizeUiText(chip.getAttribute && chip.getAttribute('aria-label'));
+      [text, aria].forEach(function (label) {
+        if (!label || found) {
+          return;
+        }
+        if (/^excluded:\s*translation$/i.test(label)) {
+          return;
+        }
+        if (/translation/i.test(label) && /exclud/i.test(label) &&
+            !/download|endorse|category|tag|size|adult|included/i.test(label)) {
+          return;
+        }
+        if (/max(?:imum)?\s+downloads?/i.test(label) ||
+            /min(?:imum)?\s+downloads?/i.test(label) ||
+            /max(?:imum)?\s+endorsements?/i.test(label) ||
+            /min(?:imum)?\s+endorsements?/i.test(label) ||
+            /^excluded:/i.test(label) ||
+            /^included:/i.test(label) ||
+            /^category:/i.test(label) ||
+            /^tag:/i.test(label) ||
+            /adult/i.test(label)) {
+          found = true;
+        }
+      });
+    });
+    return found;
+  }
+
+  function hasDomActiveNexusFilters() {
+    if (enhancer.resolvingDomActiveFilters) {
+      return !!enhancer.domFilterBrowseActive ||
+        !!(enhancer.config && enhancer.config.filterBrowseActive) ||
+        hasSidebarDownloadsFilterApplied() ||
+        hasNonDefaultNexusFilterChip();
+    }
+    enhancer.resolvingDomActiveFilters = true;
+    try {
+      return hasSidebarDownloadsFilterApplied() ||
+        hasNonDefaultNexusFilterChip();
+    } finally {
+      enhancer.resolvingDomActiveFilters = false;
+    }
+  }
+
+  function isNexusFilteredBrowse(href) {
+    if (enhancer.domFilterBrowseActive) {
+      return true;
+    }
+    if (enhancer.config && enhancer.config.filterBrowseActive) {
+      return true;
+    }
+    if (href && urlHasActiveNexusFilters(href)) {
+      return true;
+    }
+    if (!href && urlHasActiveNexusFilters(window.location.href)) {
+      return true;
+    }
+    if (!href && urlHasActiveNexusFilters(getActiveBrowseHref())) {
+      return true;
+    }
+    return hasDomActiveNexusFilters();
+  }
+
+  function refreshDomFilteredBrowseState() {
+    if (enhancer.refreshingDomFilteredBrowseState) {
+      return !!enhancer.domFilterBrowseActive;
+    }
+    enhancer.refreshingDomFilteredBrowseState = true;
+    try {
+    var domFilters = hasDomActiveNexusFilters() || hasVisibleNexusFilterChipText();
+    var urlFilters = urlHasActiveNexusFilters(window.location.href);
+    if (domFilters || urlFilters) {
+      enhancer.filteredBrowseEngaged = true;
+      if (hasNumericNexusBrowseFilters()) {
+        if (!enhancer.hadNumericNexusBrowseFilters &&
+            !enhancer.clientSideNumericFilterActive &&
+            !enhancer.clientSideNumericFilterApplyInFlight) {
+          resetFilteredBrowseTotalsState();
+          resetFilteredBrowseCatalogState();
+          enhancer.carouselAdvancePending = false;
+          enhancer.carouselAdvancePendingSince = 0;
+          enhancer.carouselPagingQuietUntil = 0;
+          suppressMatchingCountLabelsImmediately();
+        }
+        enhancer.hadNumericNexusBrowseFilters = true;
+        scheduleNumericMatchingLabelSuppress();
+        scheduleFilteredBrowseTotalFetch(enhancer.config || null);
+        try {
+          var earlyNumericDom = scanNexusResultsTotalsFromDom();
+          var earlyNumericTotal = resolveNumericFilteredResultsTotal(earlyNumericDom);
+          if (earlyNumericTotal > 0) {
+            lockNumericFilteredResultsTotal(earlyNumericTotal, earlyNumericDom);
+            hideStaleMatchingCountLabels(earlyNumericTotal);
+          } else {
+            suppressMatchingCountLabelsImmediately();
+          }
+        } catch (errEarlyNumericDom) {
+          // ignore
+        }
+        if (!enhancer.scanInProgress &&
+            !enhancer.publishingNumericFilteredResultsTotal &&
+            !enhancer.refreshingCarouselControlsFilteredTotal) {
+          scheduleNumericFilteredHeadlineSync();
+        }
+      } else if (getLockedNexusFilteredDisplayTotal() <= 0) {
+        var earlyResolved = absorbNexusFilteredTotalsFromSources();
+        if (earlyResolved > 0) {
+          lockNexusFilteredDisplayTotal(earlyResolved);
+        }
+      }
+    } else {
+      enhancer.filteredBrowseEngaged = false;
+      enhancer.hadNumericNexusBrowseFilters = false;
+      if (enhancer.numericMatchingSuppressTimer) {
+        clearInterval(enhancer.numericMatchingSuppressTimer);
+        enhancer.numericMatchingSuppressTimer = null;
+      }
+    }
+    var active = domFilters || urlFilters;
+    var prev = !!enhancer.domFilterBrowseActive;
+    enhancer.domFilterBrowseActive = active;
+    if (active !== prev) {
+      try {
+        sendToHost({ type: 'filter-browse-state', active: active });
+      } catch (errDomFilterState) {
+        // ignore
+      }
+    }
+    return active;
+    } finally {
+      enhancer.refreshingDomFilteredBrowseState = false;
+    }
+  }
+
+  function scheduleFilteredResultsHeadlineResync() {
+    if (!isNexusFilteredBrowse()) {
+      return;
+    }
+    if (enhancer.filteredHeadlineSyncTimer) {
+      clearTimeout(enhancer.filteredHeadlineSyncTimer);
+    }
+    enhancer.filteredHeadlineSyncTimer = setTimeout(function () {
+      enhancer.filteredHeadlineSyncTimer = null;
+      syncNexusFilteredResultsHeadlines();
+    }, 220);
+  }
+
+  function normalizeCountScanText(text) {
+    if (!text) {
+      return '';
+    }
+    var sample = String(text);
+    if (sample.length > 512) {
+      sample = sample.slice(0, 512);
+    }
+    var normalized = sample.replace(/\s+/g, ' ').trim();
+    if (normalized.length > 240) {
+      return normalized.slice(0, 240);
+    }
+    return normalized;
+  }
+
+  function resolveNumericFilteredResultsTotal(parsed) {
+    parsed = parsed || scanNexusResultsTotalsFromDom();
+    if (parsed.resultsTotal > 0) {
+      return parsed.resultsTotal;
+    }
+    return 0;
+  }
+
+  function reconcileNumericFilteredResultsTotal(candidate, parsed) {
+    parsed = parsed || scanNexusResultsTotalsFromDom();
+    var domResults = parsed.resultsTotal || 0;
+    var matching = parsed.matchingTotal || 0;
+    if (domResults > 0) {
+      if (candidate > 0 && candidate > domResults && matching > 0 && candidate >= matching) {
+        return domResults;
+      }
+      if (candidate <= 0 || domResults <= candidate) {
+        return domResults;
+      }
+    }
+    if (candidate > 0) {
+      if (matching > 0 && candidate >= matching && domResults <= 0) {
+        return 0;
+      }
+      return candidate;
+    }
+    return 0;
+  }
+
+  function lockNumericFilteredResultsTotal(total, parsed) {
+    var resolved = reconcileNumericFilteredResultsTotal(total, parsed);
+    if (resolved > 0) {
+      return lockNexusFilteredDisplayTotal(resolved);
+    }
+    return 0;
+  }
+
+  function hideMatchingCountLabelHost(host, text) {
+    if (!host) {
+      return;
+    }
+    if (!host.hasAttribute('data-vortex-results-original')) {
+      host.setAttribute('data-vortex-results-original', text || normalizeCountScanText(host.textContent || ''));
+    }
+    host.classList.add('vortex-enhanced-hide-native-count');
+    host.style.setProperty('display', 'none', 'important');
+  }
+
+  function walkResultsCountLabelHosts(visitor) {
+    var roots = [
+      document.querySelector('[class*="ResultsHeader"]'),
+      document.getElementById('mainContent'),
+      document.querySelector('main'),
+    ];
+    var seenRoot = {};
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      if (!root || seenRoot[root]) {
+        continue;
+      }
+      seenRoot[root] = true;
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var textNode;
+      while ((textNode = walker.nextNode())) {
+        var host = textNode.parentElement;
+        if (!host ||
+            host.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+          continue;
+        }
+        var chunk = normalizeCountScanText(textNode.textContent || '');
+        if (!chunk) {
+          continue;
+        }
+        var label = null;
+        if (/^[\d][\d,]*\s+results$/i.test(chunk)) {
+          label = 'results';
+        } else if (/^[\d][\d,]*\s+matching$/i.test(chunk)) {
+          label = 'matching';
+        } else {
+          continue;
+        }
+        if (visitor(host, chunk, label, textNode) === false) {
+          return;
+        }
+      }
+    }
+  }
+
+  function safeMatchCountLabel(text, label) {
+    var sample = normalizeCountScanText(text);
+    if (!sample) {
+      return null;
+    }
+    try {
+      var pattern = label === 'matching'
+        ? /([\d][\d,]*)\s+matching\b/i
+        : /([\d][\d,]*)\s+results\b/i;
+      var match = sample.match(pattern);
+      if (!match) {
+        return null;
+      }
+      var parsed = parseInt(match[1].replace(/,/g, ''), 10);
+      return isNaN(parsed) ? null : parsed;
+    } catch (errCountMatch) {
+      return null;
+    }
+  }
+
+  function readCountFromTextChunk(text, resultsTotal, matchingTotal) {
+    if (!text) {
+      return { resultsTotal: resultsTotal, matchingTotal: matchingTotal };
+    }
+    var matchingVal = safeMatchCountLabel(text, 'matching');
+    if (matchingVal && (!matchingTotal || matchingVal > matchingTotal)) {
+      matchingTotal = matchingVal;
+    }
+    var resultsVal = safeMatchCountLabel(text, 'results');
+    if (resultsVal && (!resultsTotal || resultsVal < resultsTotal)) {
+      resultsTotal = resultsVal;
+    }
+    return { resultsTotal: resultsTotal, matchingTotal: matchingTotal };
+  }
+
+  function scanNexusResultsTotalsFromDom() {
+    var resultsTotal = null;
+    var matchingTotal = null;
+    var roots = [
+      document.querySelector('[class*="ResultsHeader"]'),
+      document.getElementById('mainContent'),
+      document.querySelector('main'),
+    ];
+    var seenRoot = {};
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      if (!root || seenRoot[root]) {
+        continue;
+      }
+      seenRoot[root] = true;
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var textNode;
+      while ((textNode = walker.nextNode())) {
+        if (!textNode.parentElement ||
+            textNode.parentElement.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+          continue;
+        }
+        var chunk = normalizeCountScanText(textNode.textContent || '');
+        if (!chunk || chunk.length > 240) {
+          continue;
+        }
+        if (!/[\d][\d,]*\s+(?:results|matching)\b/i.test(chunk)) {
+          continue;
+        }
+        var chunkParsed = readCountFromTextChunk(chunk, resultsTotal, matchingTotal);
+        resultsTotal = chunkParsed.resultsTotal;
+        matchingTotal = chunkParsed.matchingTotal;
+      }
+    }
+    return { resultsTotal: resultsTotal, matchingTotal: matchingTotal };
+  }
+
+  function resolveFilteredBrowseDisplayTotal(resultsTotal, matchingTotal) {
+    if (resultsTotal > 0) {
+      if (matchingTotal > 0 && resultsTotal > matchingTotal) {
+        return matchingTotal;
+      }
+      return resultsTotal;
+    }
+    return matchingTotal || 0;
+  }
+
+  function urlHasNumericNexusFilters(href) {
+    try {
+      var url = href || window.location.href;
+      var params = new URLSearchParams(new URL(url).search);
+      var found = false;
+      params.forEach(function (_value, key) {
+        if (resolveNumericFilterField(key)) {
+          found = true;
+        }
+      });
+      return found;
+    } catch (errNumericUrlFilters) {
+      return false;
+    }
+  }
+
+  function hasNumericNexusBrowseFilters() {
+    return hasNonDefaultNexusFilterChip() ||
+      hasSidebarDownloadsFilterApplied() ||
+      urlHasNumericNexusFilters();
+  }
+
+  function shouldUseNumericFilteredBrowseScan(config) {
+    config = config || enhancer.config || {};
+    if (config.onlyTracked || config.onlyInstalled || isLocalCatalogMode(config)) {
+      return false;
+    }
+    if (!isBrowseModsListPathname(getBrowsePathname())) {
+      return false;
+    }
+    if (enhancer.clientSideNumericFilterActive) {
+      return true;
+    }
+    if (hasNumericNexusBrowseFilters()) {
+      return true;
+    }
+    if (enhancer.stashedSidebarNumericFilters && enhancer.stashedSidebarNumericFilters.length) {
+      return true;
+    }
+    if (enhancer.clientSideNumericFilterApplyInFlight) {
+      return true;
+    }
+    if (enhancer.nexusFilterApplyInFlight && shouldUseClientSideNumericFilterApply()) {
+      return true;
+    }
+    if (isUserInteractingWithNexusFilters() && hasSidebarDownloadsFilterApplied()) {
+      return true;
+    }
+    return false;
+  }
+
+  function browseUsesFilteredCatalogPaging() {
+    return urlHasActiveNexusFilters() ||
+      hasNumericNexusBrowseFilters() ||
+      hasVisibleNexusFilterChipText() ||
+      !!(enhancer.config && enhancer.config.filterBrowseActive);
+  }
+
+  function getGraphqlFilteredBrowseResultsTotal() {
+    if (!enhancer.nexusFilteredGraphqlTotal || enhancer.nexusFilteredGraphqlTotal <= 0) {
+      return 0;
+    }
+    if (enhancer.nexusFilteredGraphqlTotalSessionKey !== getBrowseSessionKey()) {
+      return 0;
+    }
+    return enhancer.nexusFilteredGraphqlTotal;
+  }
+
+  function mergeNexusFilteredResultsTotal(candidate) {
+    if (!candidate || candidate <= 0) {
+      return;
+    }
+    if (!enhancer.nexusFilteredResultsTotal || candidate < enhancer.nexusFilteredResultsTotal) {
+      enhancer.nexusFilteredResultsTotal = candidate;
+    }
+  }
+
+  function mergeNexusFilteredMatchingTotal(candidate) {
+    if (!candidate || candidate <= 0) {
+      return;
+    }
+    if (!enhancer.nexusFilteredMatchingTotal || candidate > enhancer.nexusFilteredMatchingTotal) {
+      enhancer.nexusFilteredMatchingTotal = candidate;
+    }
+  }
+
+  function lockNexusFilteredDisplayTotal(total) {
+    if (!total || total <= 0) {
+      return 0;
+    }
+    if (!enhancer.nexusFilteredDisplayTotalLocked ||
+        total < enhancer.nexusFilteredDisplayTotalLocked) {
+      enhancer.nexusFilteredDisplayTotalLocked = total;
+      enhancer.nexusCatalogTotal = total;
+    }
+    return enhancer.nexusFilteredDisplayTotalLocked;
+  }
+
+  function getLockedNexusFilteredDisplayTotal() {
+    return enhancer.nexusFilteredDisplayTotalLocked || 0;
+  }
+
+  function resetFilteredBrowseTotalsState() {
+    enhancer.nexusFilteredTotalsCaptured = false;
+    enhancer.nexusFilteredResultsTotal = 0;
+    enhancer.nexusFilteredMatchingTotal = 0;
+    enhancer.nexusFilteredDisplayTotalLocked = 0;
+    enhancer.nexusFilteredGraphqlTotal = 0;
+    enhancer.nexusFilteredGraphqlTotalSessionKey = '';
+    if (enhancer.filteredBrowseTotalFetchTimer) {
+      clearTimeout(enhancer.filteredBrowseTotalFetchTimer);
+      enhancer.filteredBrowseTotalFetchTimer = null;
+    }
+    enhancer.filteredBrowseTotalFetchInFlight = false;
+  }
+
+  function absorbNexusFilteredTotalsFromSources() {
+    if (!hasNumericNexusBrowseFilters()) {
+      var nextTotals = readNexusFilterTotalsFromNextData();
+      mergeNexusFilteredResultsTotal(nextTotals.resultsTotal);
+      mergeNexusFilteredMatchingTotal(nextTotals.matchingTotal);
+    }
+    document.querySelectorAll('[data-vortex-results-original]').forEach(function (node) {
+      var original = node.getAttribute('data-vortex-results-original') || '';
+      var resultsMatch = original.match(/^([\d][\d,]*)\s+results$/i);
+      var matchingMatch = original.match(/^([\d][\d,]*)\s+matching$/i);
+      if (resultsMatch) {
+        mergeNexusFilteredResultsTotal(parseInt(resultsMatch[1].replace(/,/g, ''), 10));
+      }
+      if (matchingMatch) {
+        mergeNexusFilteredMatchingTotal(parseInt(matchingMatch[1].replace(/,/g, ''), 10));
+      }
+    });
+    var parsed = scanNexusResultsTotalsFromDom();
+    mergeNexusFilteredResultsTotal(parsed.resultsTotal);
+    mergeNexusFilteredMatchingTotal(parsed.matchingTotal);
+    if (enhancer.nexusFilteredResultsTotal || enhancer.nexusFilteredMatchingTotal ||
+        parsed.resultsTotal || parsed.matchingTotal) {
+      enhancer.nexusFilteredTotalsCaptured = true;
+    }
+    return resolveFilteredBrowseDisplayTotal(
+      enhancer.nexusFilteredResultsTotal || 0,
+      enhancer.nexusFilteredMatchingTotal || 0
+    );
+  }
+
+  function captureNexusFilterTotalsFromDom(force) {
+    if (hasNumericNexusBrowseFilters() && !force) {
+      scheduleFilteredBrowseTotalFetch(enhancer.config || null);
+      return;
+    }
+    if (getLockedNexusFilteredDisplayTotal() > 0 && !force) {
+      return;
+    }
+    if (force) {
+      resetFilteredBrowseTotalsState();
+    }
+    if (!force && enhancer.nexusFilteredTotalsCaptured) {
+      return;
+    }
+    var resolved = absorbNexusFilteredTotalsFromSources();
+    if (resolved > 0) {
+      lockNexusFilteredDisplayTotal(resolved);
+    }
+  }
+
+  function getFilteredBrowseDisplayTotal() {
+    if (hasNumericNexusBrowseFilters()) {
+      if (enhancer.resolvingNumericFilteredDisplayTotal) {
+        return getLockedNexusFilteredDisplayTotal() || 0;
+      }
+      enhancer.resolvingNumericFilteredDisplayTotal = true;
+      try {
+        var graphqlTotal = getGraphqlFilteredBrowseResultsTotal();
+        if (graphqlTotal > 0) {
+          return graphqlTotal;
+        }
+        var numericLocked = getLockedNexusFilteredDisplayTotal();
+        if (numericLocked > 0) {
+          scheduleFilteredBrowseTotalFetch(enhancer.config || null);
+          return numericLocked;
+        }
+        scheduleFilteredBrowseTotalFetch(enhancer.config || null);
+        var numericDom = scanNexusResultsTotalsFromDom();
+        var numericResults = resolveNumericFilteredResultsTotal(numericDom);
+        if (numericResults > 0) {
+          return lockNumericFilteredResultsTotal(numericResults, numericDom);
+        }
+        return getLockedNexusFilteredDisplayTotal() || 0;
+      } finally {
+        enhancer.resolvingNumericFilteredDisplayTotal = false;
+      }
+    }
+    var locked = getLockedNexusFilteredDisplayTotal();
+    if (locked > 0) {
+      return locked;
+    }
+    captureNexusFilterTotalsFromDom(false);
+    locked = getLockedNexusFilteredDisplayTotal();
+    if (locked > 0) {
+      return locked;
+    }
+    var resolved = resolveFilteredBrowseDisplayTotal(
+      enhancer.nexusFilteredResultsTotal || 0,
+      enhancer.nexusFilteredMatchingTotal || 0
+    );
+    if (resolved > 0) {
+      return lockNexusFilteredDisplayTotal(resolved);
+    }
+    var parsed = scanNexusResultsTotalsFromDom();
+    resolved = resolveFilteredBrowseDisplayTotal(parsed.resultsTotal || 0, parsed.matchingTotal || 0);
+    if (resolved > 0) {
+      return lockNexusFilteredDisplayTotal(resolved);
+    }
+    var nextTotal = readNexusFilteredTotalFromNextData();
+    if (nextTotal && nextTotal > 0) {
+      return lockNexusFilteredDisplayTotal(nextTotal);
+    }
+    return enhancer.nexusCatalogTotal || 0;
+  }
+
+  function readNexusResultsTotalFromDom() {
+    var parsed = scanNexusResultsTotalsFromDom();
+    if (hasNumericNexusBrowseFilters()) {
+      return parsed.resultsTotal || null;
+    }
+    if (isNexusFilteredBrowse()) {
+      return parsed.resultsTotal || parsed.matchingTotal || null;
+    }
+    return parsed.resultsTotal || parsed.matchingTotal || null;
+  }
+
+  function suppressMatchingCountLabelsImmediately() {
+    walkResultsCountLabelHosts(function (host, text, label) {
+      if (label !== 'matching' ||
+          host.getAttribute('data-vortex-results-headline') === 'true') {
+        return;
+      }
+      hideMatchingCountLabelHost(host, text);
+    });
+  }
+
+  function scheduleNumericMatchingLabelSuppress() {
+    if (!hasNumericNexusBrowseFilters()) {
+      if (enhancer.numericMatchingSuppressTimer) {
+        clearInterval(enhancer.numericMatchingSuppressTimer);
+        enhancer.numericMatchingSuppressTimer = null;
+      }
+      return;
+    }
+    suppressMatchingCountLabelsImmediately();
+    if (enhancer.numericMatchingSuppressTimer) {
+      return;
+    }
+    var suppressTicks = 0;
+    enhancer.numericMatchingSuppressTimer = setInterval(function () {
+      suppressTicks += 1;
+      if (!hasNumericNexusBrowseFilters() || suppressTicks > 6) {
+        clearInterval(enhancer.numericMatchingSuppressTimer);
+        enhancer.numericMatchingSuppressTimer = null;
+        return;
+      }
+      suppressMatchingCountLabelsImmediately();
+    }, 700);
+  }
+
+  function hideStaleMatchingCountLabels(total) {
+    walkResultsCountLabelHosts(function (host, text, label) {
+      if (label !== 'matching' ||
+          host.getAttribute('data-vortex-results-headline') === 'true') {
+        return;
+      }
+      if (hasNumericNexusBrowseFilters()) {
+        hideMatchingCountLabelHost(host, text);
+        return;
+      }
+      if (!total || total <= 0) {
+        return;
+      }
+      var parsed = parseInt(text.replace(/[^\d]/g, ''), 10);
+      if (!parsed || parsed <= total) {
+        return;
+      }
+      hideMatchingCountLabelHost(host, text);
+    });
+  }
+
+  function applyNumericFilteredResultsHeadline(total) {
+    total = reconcileNumericFilteredResultsTotal(total);
+    if (!total || total <= 0) {
+      suppressMatchingCountLabelsImmediately();
+      return;
+    }
+    var label = formatResultsCount(total) + ' results';
+    var headline = document.querySelector('[data-vortex-results-headline="true"]');
+    if (!headline) {
+      headline = findResultsHeadlineElement();
+    }
+    if (headline) {
+      if (!headline.hasAttribute('data-vortex-results-original')) {
+        headline.setAttribute(
+          'data-vortex-results-original',
+          normalizeCountScanText(headline.textContent || '')
+        );
+      }
+      headline.textContent = label;
+      headline.setAttribute('data-vortex-results-headline', 'true');
+      headline.classList.remove('vortex-enhanced-hide-native-count');
+      headline.style.removeProperty('display');
+    }
+    hideStaleMatchingCountLabels(total);
+  }
+
+  function publishNumericFilteredResultsTotal(total, parsed) {
+    if (!total || total <= 0) {
+      return 0;
+    }
+    if (parsed) {
+      total = reconcileNumericFilteredResultsTotal(total, parsed);
+    }
+    if (!total || total <= 0) {
+      return 0;
+    }
+    if (enhancer.publishingNumericFilteredResultsTotal) {
+      lockNumericFilteredResultsTotal(total, parsed);
+      return total;
+    }
+    enhancer.publishingNumericFilteredResultsTotal = true;
+    try {
+      lockNumericFilteredResultsTotal(total, parsed);
+      var config = enhancer.config || {};
+      var catalogLen = (enhancer.filteredCarouselCatalog || []).length;
+      if (shouldUseNumericFilteredBrowseScan(config)) {
+        updateMinimalCarouselControlsInline(config, enhancer.filteredCarouselCatalog || [], total);
+      } else {
+        var pageSize = getCarouselPageSize(config);
+        var controls = document.querySelector('.vortex-enhanced-carousel-controls');
+        if (controls) {
+          updateCarouselControls(total, Math.max(1, Math.ceil(total / pageSize)), pageSize,
+            enhancer.globalPageIndex || 0, {
+              skipCatalogResolve: true,
+              loadedCatalogCount: catalogLen,
+              displayTotal: total,
+              catalogPages: Math.max(1, Math.ceil(total / pageSize)),
+            });
+        }
+      }
+      setTimeout(function () {
+        try {
+          suppressMatchingCountLabelsImmediately();
+        } catch (errSuppressAsync) {
+          // ignore
+        }
+      }, 0);
+    } finally {
+      enhancer.publishingNumericFilteredResultsTotal = false;
+    }
+    return total;
+  }
+
+  function rewriteFilteredCountTextNodes(total) {
+    if (hasNumericNexusBrowseFilters()) {
+      return;
+    }
+    var matchingLabel = formatResultsCount(total) + ' results';
+    var roots = [
+      document.getElementById('mainContent'),
+      document.querySelector('[class*="ResultsHeader"]'),
+      document.querySelector('main'),
+    ];
+    var seenRoot = {};
+    enhancer.syncingFilteredHeadlines = true;
+    try {
+      for (var r = 0; r < roots.length; r++) {
+        var root = roots[r];
+        if (!root || seenRoot[root]) {
+          continue;
+        }
+        seenRoot[root] = true;
+        var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        var node;
+        while ((node = walker.nextNode())) {
+          if (node.parentElement &&
+              node.parentElement.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+            continue;
+          }
+          var text = normalizeCountScanText(node.textContent || '');
+          if (!text) {
+            continue;
+          }
+          if (!safeMatchCountLabel(text, 'results') && !safeMatchCountLabel(text, 'matching')) {
+            continue;
+          }
+          node.textContent = matchingLabel;
+        }
+      }
+    } finally {
+      enhancer.syncingFilteredHeadlines = false;
+    }
+  }
+
+  function applyCanonicalFilteredResultsHeadline(total) {
+    if (!total || total <= 0) {
+      return;
+    }
+    var label = formatResultsCount(total) + ' results';
+    var canonicalHost = null;
+    var headerShells = document.querySelectorAll('[class*="ResultsHeader"], [class*="ModsHeader"], [class*="ModsToolbar"]');
+    if (!headerShells.length) {
+      headerShells = document.querySelectorAll('#mainContent > div, main > div');
+    }
+    enhancer.syncingFilteredHeadlines = true;
+    try {
+      for (var s = 0; s < headerShells.length; s++) {
+        var shell = headerShells[s];
+        if (shell.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+          continue;
+        }
+        var walker = document.createTreeWalker(shell, NodeFilter.SHOW_TEXT, null);
+        var textNode;
+        while ((textNode = walker.nextNode())) {
+          var text = normalizeCountScanText(textNode.textContent || '');
+          if (!text || !/[\d][\d,]*\s+(?:results|matching)\b/i.test(text)) {
+            continue;
+          }
+          var host = textNode.parentElement;
+          if (!host || host.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+            continue;
+          }
+          if (!host.hasAttribute('data-vortex-results-original')) {
+            host.setAttribute('data-vortex-results-original', text);
+          }
+          if (!canonicalHost) {
+            textNode.textContent = label;
+            host.setAttribute('data-vortex-results-headline', 'true');
+            host.classList.remove('vortex-enhanced-hide-native-count');
+            host.style.removeProperty('display');
+            canonicalHost = host;
+            continue;
+          }
+          if (host === canonicalHost || canonicalHost.contains(host) || host.contains(canonicalHost)) {
+            textNode.textContent = label;
+            continue;
+          }
+          host.classList.add('vortex-enhanced-hide-native-count');
+          host.style.setProperty('display', 'none', 'important');
+        }
+      }
+      if (!canonicalHost) {
+        var fallback = findResultsHeadlineElement();
+        if (fallback) {
+          fallback.textContent = label;
+          fallback.setAttribute('data-vortex-results-headline', 'true');
+          fallback.classList.remove('vortex-enhanced-hide-native-count');
+          fallback.style.removeProperty('display');
+          canonicalHost = fallback;
+        }
+      }
+      if (!hasNumericNexusBrowseFilters()) {
+        rewriteFilteredCountTextNodes(total);
+      }
+    } finally {
+      enhancer.syncingFilteredHeadlines = false;
+    }
+  }
+
+  function syncFilteredBrowseDocumentState() {
+    if (isNexusFilteredBrowse()) {
+      document.documentElement.classList.add('vortex-enhanced-filtered-browse');
+    } else {
+      document.documentElement.classList.remove('vortex-enhanced-filtered-browse');
+    }
+  }
+
+  function syncNexusFilteredResultsHeadlines() {
+    if (enhancer.syncingFilteredHeadlinePass) {
+      return;
+    }
+    enhancer.syncingFilteredHeadlinePass = true;
+    try {
+    syncFilteredBrowseDocumentState();
+    if (!isNexusFilteredBrowse()) {
+      return;
+    }
+    if (hasNumericNexusBrowseFilters() || shouldUseNumericFilteredBrowseScan()) {
+      scheduleFilteredBrowseTotalFetch(enhancer.config || null);
+      return;
+    }
+    if (getLockedNexusFilteredDisplayTotal() <= 0) {
+      captureNexusFilterTotalsFromDom(false);
+    }
+    var total = pinNexusFilteredResultsTotal();
+    if (!total || total <= 0) {
+      return;
+    }
+    applyCanonicalFilteredResultsHeadline(total);
+    refreshCarouselControlsFilteredTotal();
+    } finally {
+      enhancer.syncingFilteredHeadlinePass = false;
+    }
+  }
+
+  function pinNexusFilteredResultsTotal() {
+    if (!isNexusFilteredBrowse()) {
+      return 0;
+    }
+    var total = getFilteredBrowseDisplayTotal();
+    if (total > 0) {
+      lockNexusFilteredDisplayTotal(total);
+    }
+    return total;
   }
 
   function parseNexusResultsTotal() {
@@ -832,36 +2588,51 @@
       }
     }
 
+    if (isNexusFilteredBrowse()) {
+      var lockedFilteredTotal = getLockedNexusFilteredDisplayTotal();
+      if (lockedFilteredTotal > 0) {
+        return lockedFilteredTotal;
+      }
+      if (enhancer.nexusCatalogTotal && enhancer.nexusCatalogTotal > 0) {
+        return enhancer.nexusCatalogTotal;
+      }
+    }
+
     if (enhancer.nexusCatalogTotal && enhancer.nexusCatalogTotal > 0) {
       return enhancer.nexusCatalogTotal;
+    }
+
+    var domTotal = readNexusResultsTotalFromDom();
+    if (domTotal && domTotal > 0) {
+      if (isNexusFilteredBrowse()) {
+        return lockNexusFilteredDisplayTotal(domTotal) || domTotal;
+      }
+      return domTotal;
     }
 
     var headline = document.querySelector('[data-vortex-results-headline="true"]');
     if (headline) {
       var original = headline.getAttribute('data-vortex-results-original');
       if (original) {
-        var originalMatch = original.match(/^([\d][\d,]*)\s+results$/i);
+        var originalMatch = original.match(/^([\d][\d,]*)\s+(?:results|matching)$/i);
         if (originalMatch) {
           return parseInt(originalMatch[1].replace(/,/g, ''), 10);
         }
       }
-    }
-
-    var nodes = document.querySelectorAll('span, div, p, strong');
-    for (var i = 0; i < nodes.length; i++) {
-      if (nodes[i].closest('.vortex-enhanced-carousel-controls')) {
-        continue;
-      }
-      var text = (nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
-      var match = text.match(/^([\d][\d,]*)\s+results$/i);
-      if (match) {
-        return parseInt(match[1].replace(/,/g, ''), 10);
+      var headlineText = (headline.textContent || '').replace(/\s+/g, ' ').trim();
+      var headlineMatch = headlineText.match(/^([\d][\d,]*)\s+(?:results|matching)$/i);
+      if (headlineMatch) {
+        return parseInt(headlineMatch[1].replace(/,/g, ''), 10);
       }
     }
     return null;
   }
 
-  function parseGraphInt(value) {
+  function parseGraphInt(value, depth) {
+    depth = depth || 0;
+    if (depth > 8) {
+      return null;
+    }
     if (value === null || value === undefined) {
       return null;
     }
@@ -874,13 +2645,13 @@
     }
     if (typeof value === 'object') {
       if (value.value != null) {
-        return parseGraphInt(value.value);
+        return parseGraphInt(value.value, depth + 1);
       }
       if (value.kb != null) {
-        return parseGraphInt(value.kb);
+        return parseGraphInt(value.kb, depth + 1);
       }
       if (value.bytes != null) {
-        var bytes = parseGraphInt(value.bytes);
+        var bytes = parseGraphInt(value.bytes, depth + 1);
         return bytes == null ? null : Math.max(0, Math.round(bytes / 1024));
       }
     }
@@ -1164,6 +2935,1001 @@
     }
   }
 
+  function shouldApplyTranslationFilter() {
+    if (enhancer.userDismissedTranslationFilter) {
+      return false;
+    }
+    return !!(enhancer.clientHideTranslations || enhancer.forceDefaultFilters);
+  }
+
+  function shouldFilterTranslationsClientSide() {
+    if (enhancer.userDismissedTranslationFilter) {
+      return false;
+    }
+    return !!(enhancer.hideTranslationsApplied || enhancer.clientHideTranslations);
+  }
+
+  function hrefHasTranslationExcludedTag(href) {
+    try {
+      var url = new URL(href || window.location.href, window.location.origin);
+      return url.searchParams.getAll('excludedTag').some(function (tag) {
+        return /translation/i.test(String(tag));
+      });
+    } catch (errHref) {
+      return false;
+    }
+  }
+
+  function translationFilterDroppedBetweenHrefs(prevHref, nextHref) {
+    if (!prevHref || !nextHref || prevHref === nextHref) {
+      return false;
+    }
+    try {
+      var prev = new URL(prevHref, window.location.origin);
+      var next = new URL(nextHref, window.location.origin);
+      if (prev.pathname !== next.pathname) {
+        return false;
+      }
+      return hrefHasTranslationExcludedTag(prevHref) && !hrefHasTranslationExcludedTag(nextHref);
+    } catch (errDrop) {
+      return false;
+    }
+  }
+
+  function normalizeBrowseSessionKeyIgnoringTranslation(sessionKey) {
+    if (!sessionKey) {
+      return '';
+    }
+    try {
+      var parts = String(sessionKey).split('?');
+      var pathname = parts[0] || '';
+      var params = new URLSearchParams(parts[1] || '');
+      params.delete('excludedTag');
+      var normalized = [];
+      params.forEach(function (value, key) {
+        normalized.push(key + '=' + value);
+      });
+      normalized.sort();
+      return pathname + '?' + normalized.join('&');
+    } catch (errKey) {
+      return sessionKey;
+    }
+  }
+
+  function sessionKeyChangeIsTranslationOnly(prevKey, nextKey) {
+    if (!prevKey || !nextKey || prevKey === nextKey) {
+      return false;
+    }
+    return normalizeBrowseSessionKeyIgnoringTranslation(prevKey) ===
+      normalizeBrowseSessionKeyIgnoringTranslation(nextKey);
+  }
+
+  function translationFilterRemovedBetweenSessionKeys(prevKey, nextKey) {
+    if (!prevKey || !nextKey || prevKey === nextKey) {
+      return false;
+    }
+    try {
+      var prevParams = new URLSearchParams(String(prevKey).split('?')[1] || '');
+      var nextParams = new URLSearchParams(String(nextKey).split('?')[1] || '');
+      var prevHad = prevParams.getAll('excludedTag').some(function (tag) {
+        return /translation/i.test(String(tag));
+      });
+      var nextHas = nextParams.getAll('excludedTag').some(function (tag) {
+        return /translation/i.test(String(tag));
+      });
+      return prevHad && !nextHas;
+    } catch (errSession) {
+      return false;
+    }
+  }
+
+  function getBrowseGameSlugFromPathname(pathname) {
+    if (!pathname) {
+      return '';
+    }
+    var parts = String(pathname).split('/').filter(Boolean);
+    if (parts.length >= 3 && parts[0] === 'games' && parts[2] === 'mods') {
+      return parts[1];
+    }
+    if (parts.length >= 2 && parts[1] === 'mods') {
+      return parts[0];
+    }
+    return '';
+  }
+
+  var TRANSLATION_DISMISS_STORAGE_PREFIX = 'vortex-enhanced-translation-dismiss:';
+
+  function getTranslationDismissStorageKey(slug) {
+    slug = slug || enhancer.lastBrowseGameSlug || getBrowseGameSlugFromPathname(getBrowsePathname()) || 'global';
+    return TRANSLATION_DISMISS_STORAGE_PREFIX + slug;
+  }
+
+  function persistTranslationDismissState() {
+    if (!enhancer.userDismissedTranslationFilter) {
+      return;
+    }
+    try {
+      sessionStorage.setItem(getTranslationDismissStorageKey(), '1');
+    } catch (errPersist) {
+      // ignore storage failures
+    }
+  }
+
+  function clearTranslationDismissState(slug) {
+    try {
+      sessionStorage.removeItem(getTranslationDismissStorageKey(slug));
+    } catch (errClear) {
+      // ignore storage failures
+    }
+  }
+
+  function restoreTranslationDismissState() {
+    try {
+      if (sessionStorage.getItem(getTranslationDismissStorageKey()) !== '1') {
+        syncTranslationDismissedDocumentClass();
+        return;
+      }
+    } catch (errRestore) {
+      return;
+    }
+
+    enhancer.userDismissedTranslationFilter = true;
+    enhancer.clientHideTranslations = false;
+    enhancer.forceDefaultFilters = false;
+    enhancer.hideTranslationsApplied = false;
+    enhancer.preferHideTranslations = false;
+    enhancer.defaultFiltersApplied = true;
+    enhancer.translationUrlApplied = !translationFilterExcludedInUrl();
+    enhancer.translationUrlPending = false;
+    syncTranslationDismissedDocumentClass();
+  }
+
+  function syncTranslationDismissedDocumentClass() {
+    if (enhancer.userDismissedTranslationFilter) {
+      document.documentElement.classList.add('vortex-enhanced-translation-dismissed');
+    } else {
+      document.documentElement.classList.remove('vortex-enhanced-translation-dismissed');
+    }
+  }
+
+  function ensureDismissedBrowseChromeSafe() {
+    syncTranslationDismissedDocumentClass();
+    restoreMainBrowseContentVisibility();
+    hideNexusItemsPerPageUi();
+    tagNexusPaginationNav();
+
+    var toolbar = findResultsToolbarRow();
+    if (toolbar && isInMainBrowseColumn(toolbar, { ignoreVisibility: true })) {
+      toolbar.classList.add('vortex-enhanced-results-toolbar');
+      toolbar.classList.remove(
+        'vortex-enhanced-chrome-hidden',
+        'vortex-enhanced-browse-trim-hidden',
+        'vortex-enhanced-browse-gap-collapse',
+        'vortex-enhanced-nexus-active-filters-empty'
+      );
+      unhideBrowseContentChain(toolbar);
+    }
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters').forEach(function (node) {
+      if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+        return;
+      }
+      node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+      unhideBrowseContentChain(node);
+    });
+  }
+
+  function applyTranslationDismissRuntimeState() {
+    if (!enhancer.userDismissedTranslationFilter) {
+      return;
+    }
+    enhancer.clientHideTranslations = false;
+    enhancer.forceDefaultFilters = false;
+    enhancer.hideTranslationsApplied = false;
+    enhancer.preferHideTranslations = false;
+    enhancer.defaultFiltersApplied = true;
+  }
+
+  function noteBrowseGameContext(pathname) {
+    var slug = getBrowseGameSlugFromPathname(pathname);
+    if (!slug) {
+      return;
+    }
+    if (enhancer.lastBrowseGameSlug && slug !== enhancer.lastBrowseGameSlug) {
+      clearTranslationDismissState(enhancer.lastBrowseGameSlug);
+      enhancer.userDismissedTranslationFilter = false;
+      syncTranslationDismissedDocumentClass();
+    }
+    enhancer.lastBrowseGameSlug = slug;
+    restoreTranslationDismissState();
+  }
+
+  function isTranslationFilterChipNode(node) {
+    if (!node) {
+      return false;
+    }
+    var row = node.closest('.vortex-enhanced-nexus-active-filters');
+    if (!row) {
+      return false;
+    }
+
+    var chips = row.querySelectorAll('button, a, [role="button"]');
+    for (var i = 0; i < chips.length; i++) {
+      var chip = chips[i];
+      if (isClearAllControl(chip)) {
+        continue;
+      }
+      var text = normalizeUiText(chip.textContent);
+      if (text.indexOf('excluded:') >= 0 && text.indexOf('translation') >= 0) {
+        if (chip === node || chip.contains(node)) {
+          return true;
+        }
+      }
+    }
+
+    var current = node;
+    while (current && current !== row) {
+      var blockText = normalizeUiText(current.textContent);
+      if (blockText.indexOf('excluded:') >= 0 && blockText.indexOf('translation') >= 0) {
+        return true;
+      }
+      current = current.parentElement;
+    }
+
+    return false;
+  }
+
+  function buildUrlWithoutTranslationExcludedTag(href) {
+    try {
+      var url = new URL(href || window.location.href, window.location.origin);
+      var kept = url.searchParams.getAll('excludedTag').filter(function (tag) {
+        return !/translation/i.test(String(tag));
+      });
+      url.searchParams.delete('excludedTag');
+      kept.forEach(function (tag) {
+        url.searchParams.append('excludedTag', tag);
+      });
+      url.searchParams.delete('page');
+      url.searchParams.delete('p');
+      url.searchParams.delete('_vortex_reload');
+      return url.href;
+    } catch (errStrip) {
+      return href || window.location.href;
+    }
+  }
+
+  function isHideTranslationsCheckboxChecked(input) {
+    input = input || findHideTranslationsCheckbox();
+    if (!input) {
+      return false;
+    }
+    return !!(input.checked ||
+      input.getAttribute('aria-checked') === 'true' ||
+      input.getAttribute('data-state') === 'checked');
+  }
+
+  function syncHideTranslationsSidebar(enabled) {
+    if (enabled && enhancer.userDismissedTranslationFilter) {
+      return false;
+    }
+    var input = findHideTranslationsCheckbox();
+    if (!input) {
+      return false;
+    }
+    return setHideTranslationsControl(input, !!enabled);
+  }
+
+  // Do not click Nexus sidebar controls after chip/clear-all dismiss — that re-applies
+  // filters and wipes the browse grid. URL + chip state are already correct.
+  function syncHideTranslationsSidebarIfNeeded() {
+    if (enhancer.userDismissedTranslationFilter) {
+      return true;
+    }
+    return false;
+  }
+
+  function finalizeNexusFilterApplyUrl(href) {
+    if (!href || !enhancer.userDismissedTranslationFilter) {
+      return href;
+    }
+    return buildUrlWithoutTranslationExcludedTag(href);
+  }
+
+  function scheduleHideTranslationsSidebarOff(delayMs) {
+    setTimeout(function () {
+      if (!enhancer.userDismissedTranslationFilter) {
+        return;
+      }
+      var input = findHideTranslationsCheckbox();
+      if (!input || !isHideTranslationsCheckboxChecked(input)) {
+        return;
+      }
+      enhancer.suppressFilterEvents = true;
+      setHideTranslationsControl(input, false);
+      setTimeout(function () {
+        enhancer.suppressFilterEvents = false;
+      }, 500);
+    }, typeof delayMs === 'number' ? delayMs : 200);
+  }
+
+  function removeTranslationFromUrlViaNavigate() {
+    if (!translationFilterExcludedInUrl()) {
+      return false;
+    }
+    var next = buildUrlWithoutTranslationExcludedTag(window.location.href);
+    if (!next || next === window.location.href) {
+      return false;
+    }
+    enhancer.nexusFilterApplyInFlight = true;
+    enhancer.nexusFilterApplyStartUrl = window.location.href;
+    enhancer.pendingNexusFilterUrl = next;
+    enhancer.nexusFilterCooldownUntil = Date.now() + 20000;
+    try {
+      window.location.replace(next);
+    } catch (errReplace) {
+      try {
+        window.location.href = next;
+      } catch (errHref) {
+        enhancer.nexusFilterApplyInFlight = false;
+        enhancer.pendingNexusFilterUrl = '';
+        return false;
+      }
+    }
+    setTimeout(function () {
+      releaseNexusFilterApplyWhenStable(0);
+    }, 600);
+    return true;
+  }
+
+  function enforceTranslationDismissalState(options) {
+    options = options || {};
+    if (!enhancer.userDismissedTranslationFilter) {
+      return;
+    }
+    syncHideTranslationsSidebarIfNeeded();
+    var inGrace = enhancer.translationDismissGraceUntil &&
+      Date.now() < enhancer.translationDismissGraceUntil;
+    if (options.stripUrl !== false &&
+        !inGrace &&
+        !enhancer.translationDismissUserInitiated &&
+        translationFilterExcludedInUrl()) {
+      removeTranslationFromUrlViaNavigate();
+    }
+  }
+
+  function isBrowseContentStableForLayout() {
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    if (!host) {
+      return false;
+    }
+    var tiles = document.querySelectorAll(
+      '[data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-nexus-live-hidden)'
+    ).length;
+    return tiles >= 4;
+  }
+
+  function isTranslationFilterDismissedBrowse() {
+    return !!enhancer.userDismissedTranslationFilter;
+  }
+
+  function shouldDeferDismissLayoutCollapse() {
+    if (isTranslationFilterDismissedBrowse() && !isBrowseContentStableForLayout()) {
+      return true;
+    }
+    if (browseUrlHasRemovableActiveFilters()) {
+      return true;
+    }
+    if (enhancer.nexusFilterApplyInFlight) {
+      return true;
+    }
+    if (enhancer.translationDismissGraceUntil && Date.now() < enhancer.translationDismissGraceUntil) {
+      return true;
+    }
+    return !isBrowseContentStableForLayout();
+  }
+
+  function syncDismissedFilterBrowseState() {
+    if (!enhancer.userDismissedTranslationFilter) {
+      return;
+    }
+    ensureDismissedBrowseChromeSafe();
+    syncBrowseUrlFilterDocumentState();
+    var toolbar = findResultsToolbarRow();
+    if (toolbar) {
+      toolbar.classList.remove('vortex-enhanced-has-active-filters');
+    }
+  }
+
+  function isDismissedCarouselBrowseMode(config) {
+    return !!(enhancer.userDismissedTranslationFilter && config &&
+      !isLocalCatalogMode(config) && !config.onlyTracked && !config.onlyInstalled);
+  }
+
+  function isPooledNexusCarouselBrowseMode(config) {
+    if (!config || isLocalCatalogMode(config) || config.onlyTracked || config.onlyInstalled) {
+      return false;
+    }
+    return isDismissedCarouselBrowseMode(config) || isFilteredBrowseSession(config);
+  }
+
+  function prepareDismissedCarouselBrowse(config) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return;
+    }
+    syncDismissedFilterBrowseState();
+    ensureDismissedBrowseChromeSafe();
+    document.querySelectorAll('aside, #filters-panel').forEach(function (node) {
+      if (node.closest && node.closest('#vortex-enhanced-pool-host, #vortex-enhanced-live-stash')) {
+        return;
+      }
+      node.classList.remove(
+        'vortex-enhanced-browse-trim-hidden',
+        'vortex-enhanced-chrome-hidden',
+        'vortex-enhanced-browse-gap-collapse'
+      );
+      unhideBrowseContentChain(node);
+    });
+  }
+
+  function getVisibleCarouselCatalogCount(config, cards) {
+    // Do not call collectCards() here. Its filtered-mode branch asks
+    // filteredBrowseUsesLiveCatalogOnly(), which eventually calls this
+    // function again and overflows the stack.
+    var source = cards && cards.length ? cards : null;
+    if (!source) {
+      source = collectLiveGridCards(config);
+      if (enhancer.tilePool && enhancer.tilePool.length) {
+        var combined = source.slice();
+        var seen = {};
+        for (var i = 0; i < combined.length; i++) {
+          if (combined[i] && combined[i].modId) {
+            seen[String(combined[i].modId)] = true;
+          }
+        }
+        for (var p = 0; p < enhancer.tilePool.length; p++) {
+          var entry = enhancer.tilePool[p];
+          if (!entry) {
+            continue;
+          }
+          if (entry.modId && seen[String(entry.modId)]) {
+            continue;
+          }
+          if (entry.modId) {
+            seen[String(entry.modId)] = true;
+          }
+          combined.push(entry);
+        }
+        source = combined;
+      }
+    }
+    applyFilters(source, config);
+    return getVisibleCarouselCards(source).length;
+  }
+
+  function carouselPageFullyLoaded(pageIndex, visibleCount, pageSize) {
+    pageSize = pageSize || getCarouselPageSize(enhancer.config || {});
+    var page = typeof pageIndex === 'number' && pageIndex >= 0 ? pageIndex : 0;
+    return visibleCount >= (page + 1) * pageSize;
+  }
+
+  function getMaxFullCarouselPageIndex(pageSize, visibleCount) {
+    if (!visibleCount || visibleCount <= 0) {
+      return 0;
+    }
+    pageSize = pageSize || getCarouselPageSize(enhancer.config || {});
+    var fullPages = Math.floor(visibleCount / pageSize);
+    return Math.max(0, fullPages - 1);
+  }
+
+  function ensureDismissedLiveBatchMerged(config) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return false;
+    }
+    var liveCount = collectLiveGridCards(config).length;
+    if (liveCount < 8) {
+      return false;
+    }
+    if (!usesMergedCarouselPool()) {
+      mergeLiveGridIntoPool(config);
+      return true;
+    }
+    return false;
+  }
+
+  function maybePrefetchDismissedLiveBatch(config) {
+    if (!isPooledNexusCarouselBrowseMode(config)) {
+      return;
+    }
+    if (urlHasActiveNexusFilters() && (enhancer.globalPageIndex || 0) < 2) {
+      return;
+    }
+    if (isTranslationDismissHandsOff() || isTranslationDismissNavigationPending()) {
+      return;
+    }
+    if (enhancer.pendingPoolFetch || enhancer.pendingNexusBatchAdvance ||
+        enhancer.nativeNavFetchInFlight || enhancer.pendingNativeCatalogFetch ||
+        enhancer.carouselAdvancePending || enhancer.dismissedBatchPrefetchInFlight) {
+      return;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var catalogCount = getVisibleCarouselCatalogCount(config);
+    var filteredBrowse = urlHasActiveNexusFilters();
+    var prefetchLeadPages = filteredBrowse ? 2 : 2;
+    var neededAhead = (enhancer.globalPageIndex + prefetchLeadPages) * pageSize;
+    if (!filteredBrowse && catalogCount >= neededAhead) {
+      return;
+    }
+    if (filteredBrowse && !filteredBrowseNeedsNativeBatch(pageSize, catalogCount)) {
+      return;
+    }
+
+    var nextPage = getNextUnfetchedNexusPage();
+    if (!nextPage) {
+      return;
+    }
+
+    enhancer.dismissedBatchPrefetchInFlight = true;
+    fetchNexusBatchPage(nextPage, config, {
+      allowNavigation: filteredBrowse ? 'soft' : false,
+    }).then(function (ok) {
+      enhancer.dismissedBatchPrefetchInFlight = false;
+      if (ok) {
+        scheduleDebouncedDismissedPoolSnapshot(config);
+        if (window.__vortexBrowseEnhancer && isPooledNexusCarouselBrowseMode(config)) {
+          var currentPage = enhancer.globalPageIndex || 0;
+          var refreshedCount = getVisibleCarouselCatalogCount(config);
+          if (carouselPageFullyLoaded(currentPage, refreshedCount, pageSize)) {
+            return;
+          }
+          applyDismissedCatalogCarouselPage(collectCards(config), config);
+        } else if (window.__vortexBrowseEnhancer) {
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        }
+      }
+    });
+  }
+
+  function dismissedCatalogCoversCarouselPage(config, pageIndex) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return false;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var page = typeof pageIndex === 'number' && pageIndex >= 0 ? pageIndex : (enhancer.globalPageIndex || 0);
+    return carouselPageFullyLoaded(page, getVisibleCarouselCatalogCount(config), pageSize);
+  }
+
+  function dismissedLiveGridCoversCarouselPage(config, pageIndex) {
+    return dismissedCatalogCoversCarouselPage(config, pageIndex);
+  }
+
+  function dismissedBrowseUsesLiveGridOnly(config, pageIndex) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return false;
+    }
+    if (isTranslationDismissNavigationPending() || isTranslationDismissHandsOff()) {
+      return true;
+    }
+    return dismissedCatalogCoversCarouselPage(config,
+      typeof pageIndex === 'number' ? pageIndex : (enhancer.globalPageIndex || 0));
+  }
+
+  function shouldUseDismissedTransitionLivePage(config) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return false;
+    }
+    if (enhancer.nativeNavFetchInFlight || enhancer.pendingNativeCatalogFetch ||
+        enhancer.carouselAdvancePending) {
+      return false;
+    }
+    return dismissedBrowseUsesLiveGridOnly(config, enhancer.globalPageIndex || 0);
+  }
+
+  function sliceCardsSatisfiedByLiveGrid(slice, grid) {
+    if (!slice || !slice.length || !grid) {
+      return false;
+    }
+    var matched = 0;
+    for (var i = 0; i < slice.length; i++) {
+      var card = slice[i].card;
+      if (card && card.isConnected && grid.contains(card)) {
+        matched++;
+      }
+    }
+    return matched >= slice.length;
+  }
+
+  function applyDismissedCatalogCarouselPage(cards, config) {
+    if (!config) {
+      return;
+    }
+    ensureCarouselLayout(config);
+    restoreMainBrowseContentVisibility();
+
+    var useLiveOnly = isTranslationDismissNavigationPending() || isTranslationDismissHandsOff() ||
+      filteredBrowseUsesLiveCatalogOnly();
+    var catalogCards;
+    if (cards && cards.length) {
+      catalogCards = cards;
+    } else if (useLiveOnly && isFilteredBrowseSession(config)) {
+      catalogCards = getFilteredCarouselVisibleEntries(config);
+    } else if (useLiveOnly) {
+      catalogCards = collectLiveGridCards(config);
+    } else {
+      catalogCards = collectCards(config);
+    }
+    if (!catalogCards.length) {
+      var liveFallback = collectLiveGridCards(config);
+      if (liveFallback.length) {
+        catalogCards = liveFallback;
+      } else {
+        scheduleFilteredBrowseRescan();
+        return;
+      }
+    }
+
+    applyFilters(catalogCards, config);
+    var visible = sortCatalogEntries(getVisibleCarouselCards(catalogCards));
+    var pageSize = getCarouselPageSize(config);
+    var currentPage = Math.max(0, enhancer.globalPageIndex || 0);
+    var catalogCount = visible.length;
+
+    if (urlHasActiveNexusFilters() || useLiveOnly) {
+      var clampedFilteredPage = clampFilteredBrowseLivePageIndex(pageSize, catalogCount, currentPage, {});
+      if (clampedFilteredPage !== currentPage) {
+        currentPage = clampedFilteredPage;
+        enhancer.globalPageIndex = clampedFilteredPage;
+        enhancer.batchPageIndex = clampedFilteredPage;
+        saveCarouselPagingState();
+      }
+    } else if (!carouselPageFullyLoaded(currentPage, catalogCount, pageSize)) {
+      var maxLoadedPage = getMaxFullCarouselPageIndex(pageSize, catalogCount);
+      if (currentPage > maxLoadedPage) {
+        currentPage = maxLoadedPage;
+        enhancer.globalPageIndex = maxLoadedPage;
+        enhancer.batchPageIndex = maxLoadedPage;
+        saveCarouselPagingState();
+      }
+    }
+
+    var localStart = currentPage * pageSize;
+    var pageSlice = visible.slice(localStart, localStart + pageSize);
+    if (pageSlice.length === 0 && visible.length > 0 && currentPage === 0) {
+      pageSlice = visible.slice(0, pageSize);
+      localStart = 0;
+    }
+    if (!(urlHasActiveNexusFilters() || useLiveOnly) &&
+        pageSlice.length < pageSize &&
+        localStart + pageSize > visible.length &&
+        canFetchMoreCarouselBatches()) {
+      var maxFullPage = getMaxFullCarouselPageIndex(pageSize, visible.length);
+      if (currentPage > maxFullPage) {
+        currentPage = maxFullPage;
+        enhancer.globalPageIndex = maxFullPage;
+        enhancer.batchPageIndex = maxFullPage;
+        saveCarouselPagingState();
+        localStart = currentPage * pageSize;
+        pageSlice = visible.slice(localStart, localStart + pageSize);
+      }
+    }
+
+    var pageModIds = [];
+    for (var k = 0; k < pageSlice.length; k++) {
+      if (pageSlice[k].modId) {
+        pageModIds.push(pageSlice[k].modId);
+      }
+    }
+    pageModIds.sort(function (a, b) { return a - b; });
+    var sliceKey = getCarouselSliceKey(pageSize, pageModIds);
+    var controlVisibleCount = getEffectiveResultsTotal(config, catalogCount);
+    var batchPages = Math.max(1, Math.ceil(Math.max(controlVisibleCount, 1) / pageSize));
+
+    if (sliceKey === enhancer.lastAppliedSliceKey && pageSlice.length > 0) {
+      enhancer.batchPageIndex = currentPage;
+      updateCarouselControls(controlVisibleCount, batchPages, pageSize, currentPage);
+      if (urlHasActiveNexusFilters()) {
+        decorateVisibleGridTiles(config);
+      } else {
+        for (var sd = 0; sd < pageSlice.length; sd++) {
+          if (pageSlice[sd].card) {
+            decorateCard(pageSlice[sd].card, pageSlice[sd].modId, pageSlice[sd].installed, config);
+          }
+        }
+      }
+      installCarouselWheelHandler();
+      scheduleDebouncedDismissedPrefetch(config);
+      if (urlHasActiveNexusFilters()) {
+        scheduleFilteredBrowseDecorationRetry(config);
+      }
+      return;
+    }
+    enhancer.lastAppliedSliceKey = sliceKey;
+
+    var grid = resolveNexusModGridElement();
+    var poolHost = useLiveOnly ? null : ensurePoolHost();
+    var stash = useLiveOnly ? null : ensureLiveStashHost();
+    var sliceModIds = {};
+    for (var ps = 0; ps < pageSlice.length; ps++) {
+      if (pageSlice[ps].modId) {
+        sliceModIds[String(pageSlice[ps].modId)] = true;
+      }
+    }
+
+    for (var show = 0; show < pageSlice.length; show++) {
+      var sliceCard = pageSlice[show].card;
+      if (!sliceCard) {
+        continue;
+      }
+      if (grid && sliceCard.isConnected && grid.contains(sliceCard)) {
+        sliceCard.classList.remove(
+          'vortex-enhanced-carousel-hidden',
+          'vortex-enhanced-nexus-live-hidden',
+          'vortex-enhanced-hidden'
+        );
+        sliceCard.style.removeProperty('display');
+      } else if (!useLiveOnly && grid) {
+        setCarouselTileVisibility(sliceCard, true, grid, poolHost, stash);
+      }
+      decorateCard(sliceCard, pageSlice[show].modId, pageSlice[show].installed, config);
+    }
+
+    if (grid) {
+      grid.querySelectorAll('[data-e2eid="mod-tile"]').forEach(function (tile) {
+        var tileModId = extractModIdFromTile(tile);
+        var showTile = !!(tileModId && sliceModIds[String(tileModId)]);
+        if (showTile) {
+          tile.classList.remove(
+            'vortex-enhanced-nexus-live-hidden',
+            'vortex-enhanced-hidden',
+            'vortex-enhanced-carousel-hidden'
+          );
+          tile.style.removeProperty('display');
+        } else {
+          tile.classList.add('vortex-enhanced-carousel-hidden');
+          tile.style.setProperty('display', 'none', 'important');
+        }
+      });
+    }
+
+    enhancer.batchPageIndex = currentPage;
+    updateCarouselControls(controlVisibleCount, batchPages, pageSize, currentPage);
+    ensureCarouselControlsBar();
+    protectBrowseControlsFromChromeHide();
+    hideBrowsePageFooter();
+    installCarouselWheelHandler();
+    syncNexusResultsHeadline(config);
+
+    var visibleKey = pageModIds.join(',');
+    if (visibleKey !== enhancer.lastVisibleModsKey) {
+      enhancer.lastVisibleModsKey = visibleKey;
+      if (pageModIds.length > 0) {
+        sendToHost({ type: 'visible-mods', modIds: pageModIds });
+      }
+    }
+
+    if (!useLiveOnly) {
+      scheduleDebouncedDismissedPoolSnapshot(config);
+    }
+    scheduleDebouncedDismissedPrefetch(config);
+    if (urlHasActiveNexusFilters()) {
+      decorateVisibleGridTiles(config);
+      scheduleFilteredBrowseDecorationRetry(config);
+    }
+  }
+
+  function applyDismissedTransitionLivePage(cards, config) {
+    applyDismissedCatalogCarouselPage(cards, config);
+  }
+
+  function scheduleDebouncedDismissedPrefetch(config) {
+    if (!isPooledNexusCarouselBrowseMode(config)) {
+      return;
+    }
+    if (urlHasActiveNexusFilters() && (enhancer.globalPageIndex || 0) < 2) {
+      return;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var catalogCount = getVisibleCarouselCatalogCount(config);
+    var filteredBrowse = urlHasActiveNexusFilters();
+    var prefetchLeadPages = 2;
+    var neededAhead = (enhancer.globalPageIndex + prefetchLeadPages) * pageSize;
+    var shouldPrefetch = (filteredBrowse && filteredBrowseNeedsNativeBatch(pageSize, catalogCount)) ||
+      (!filteredBrowse && catalogCount < neededAhead);
+    if (!shouldPrefetch) {
+      return;
+    }
+    if (enhancer.dismissedPrefetchDebounceTimer) {
+      return;
+    }
+    enhancer.dismissedPrefetchDebounceTimer = setTimeout(function () {
+      enhancer.dismissedPrefetchDebounceTimer = null;
+      maybePrefetchDismissedLiveBatch(config);
+    }, 600);
+  }
+
+  function scheduleDebouncedDismissedPoolSnapshot(config) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return;
+    }
+    if (enhancer.dismissedPoolSnapshotTimer) {
+      clearTimeout(enhancer.dismissedPoolSnapshotTimer);
+    }
+    enhancer.dismissedPoolSnapshotTimer = setTimeout(function () {
+      enhancer.dismissedPoolSnapshotTimer = null;
+      saveDismissedBrowsePoolSnapshot(config);
+    }, 2500);
+  }
+
+  function applyDismissedPoolCarouselPage(cards, config) {
+    applyDismissedCatalogCarouselPage(cards, config);
+  }
+
+  function isTranslationDismissNavigationPending() {
+    if (!enhancer.userDismissedTranslationFilter) {
+      return false;
+    }
+    if (enhancer.translationDismissNavPending) {
+      return true;
+    }
+    if (enhancer.nexusFilterApplyInFlight) {
+      return true;
+    }
+    if (!enhancer.translationDismissUserInitiated || !enhancer.translationDismissedAt) {
+      return false;
+    }
+    var elapsed = Date.now() - enhancer.translationDismissedAt;
+    if (elapsed > 15000) {
+      return false;
+    }
+    if (translationFilterExcludedInUrl()) {
+      return true;
+    }
+    var liveTiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+    return liveTiles < 8 && elapsed < 8000;
+  }
+
+  function clearTranslationDismissNavigationPendingIfReady() {
+    if (!enhancer.translationDismissNavPending) {
+      return;
+    }
+    if (translationFilterExcludedInUrl() || isBrowseOopsPage()) {
+      return;
+    }
+    var liveTiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+    if (liveTiles >= 4) {
+      enhancer.translationDismissNavPending = false;
+      enhancer.enhancementFullyPaused = false;
+    }
+  }
+
+  function scheduleDismissSidebarSyncWhenStable(delayMs) {
+    setTimeout(function () {
+      if (!enhancer.userDismissedTranslationFilter) {
+        return;
+      }
+      if (isTranslationDismissNavigationPending()) {
+        scheduleDismissSidebarSyncWhenStable(Math.min(delayMs + 350, 2500));
+        return;
+      }
+      syncHideTranslationsSidebarIfNeeded();
+    }, delayMs);
+  }
+
+  function startTranslationDismissGuard() {
+    if (enhancer.translationDismissGuardTimer) {
+      clearInterval(enhancer.translationDismissGuardTimer);
+    }
+    enhancer.translationDismissGuardStartedAt = Date.now();
+    var attempts = 0;
+    scheduleDismissSidebarSyncWhenStable(500);
+    scheduleDismissSidebarSyncWhenStable(1200);
+    scheduleDismissSidebarSyncWhenStable(2500);
+    enhancer.translationDismissGuardTimer = setInterval(function () {
+      attempts += 1;
+      if (!enhancer.userDismissedTranslationFilter ||
+          attempts > 40 ||
+          Date.now() - (enhancer.translationDismissGuardStartedAt || 0) > 8000) {
+        clearInterval(enhancer.translationDismissGuardTimer);
+        enhancer.translationDismissGuardTimer = null;
+        return;
+      }
+      ensureDismissedBrowseChromeSafe();
+    }, 250);
+  }
+
+  function acknowledgeUserTranslationFilterDismissal(reason) {
+    if (enhancer.userDismissedTranslationFilter) {
+      syncHideTranslationsSidebarIfNeeded();
+      return;
+    }
+    traceStep('translation-filter-dismissed', {
+      reason: reason || 'unknown',
+      href: window.location.href,
+      hadExcludedTag: translationFilterExcludedInUrl(),
+    });
+
+    var userInitiated = reason === 'chip' ||
+      reason === 'clear-all' ||
+      reason === 'chip-capture' ||
+      reason === 'clear-all-capture';
+
+    enhancer.userDismissedTranslationFilter = true;
+    enhancer.translationDismissUserInitiated = userInitiated;
+    enhancer.translationDismissGraceUntil = Date.now() + (userInitiated ? 6500 : 1500);
+    enhancer.clientHideTranslations = false;
+    enhancer.forceDefaultFilters = false;
+    enhancer.hideTranslationsApplied = false;
+    enhancer.preferHideTranslations = false;
+    enhancer.defaultFiltersApplied = true;
+    enhancer.translationUrlApplied = false;
+    enhancer.translationUrlPending = false;
+    enhancer.nexusFilterApplyInFlight = false;
+    enhancer.pendingNexusFilterUrl = '';
+    enhancer.nexusFilterCooldownUntil = Date.now() + (userInitiated ? 2500 : 20000);
+
+    if (enhancer.translationFilterWatchdog) {
+      clearInterval(enhancer.translationFilterWatchdog);
+      enhancer.translationFilterWatchdog = null;
+    }
+
+    persistTranslationDismissState();
+    resetNexusResultsHeadlineCache();
+    startTranslationDismissGuard();
+    enhancer.translationDismissedAt = Date.now();
+    enhancer.translationDismissNavPending = userInitiated;
+    enhancer.translationDismissHandsOffUntil = Date.now() + 4000;
+    clearCarouselQuietPeriod();
+    enhancer.lastAppliedSliceKey = '';
+    enhancer.tilePool = [];
+    enhancer.dismissedBatchPrefetchInFlight = false;
+    enhancer.dismissedBatchPrefetchDone = false;
+    enhancer.dismissedPoolRestorePromise = null;
+    enhancer.dismissedPoolPagingQuietUntil = 0;
+    if (enhancer.dismissedPrefetchDebounceTimer) {
+      clearTimeout(enhancer.dismissedPrefetchDebounceTimer);
+      enhancer.dismissedPrefetchDebounceTimer = null;
+    }
+    if (enhancer.dismissedPoolSnapshotTimer) {
+      clearTimeout(enhancer.dismissedPoolSnapshotTimer);
+      enhancer.dismissedPoolSnapshotTimer = null;
+    }
+    try {
+      sessionStorage.removeItem(getDismissedPoolStorageKey());
+    } catch (errClearDismissedPool) {
+      // ignore
+    }
+    enhancer.catalogIndicesBootstrapped = false;
+    enhancer.catalogModIdToIndex = {};
+    document.querySelectorAll('[data-vortex-catalog-index]').forEach(function (node) {
+      node.removeAttribute('data-vortex-catalog-index');
+    });
+    unhideAllCarouselTiles();
+    restoreStashedLiveNexusTiles();
+    syncTranslationDismissedDocumentClass();
+    enhancer.enhancementFullyPaused = false;
+    setTimeout(function () {
+      enhancer.translationDismissUserInitiated = false;
+    }, 8000);
+    if (window.__vortexBrowseEnhancer) {
+      window.__vortexBrowseEnhancer.scheduleScan(true);
+    }
+  }
+
+  function noteNexusActiveFilterUserAction(event) {
+    if (!event || !event.target) {
+      return;
+    }
+
+    var clearEl = event.target.closest('.vortex-enhanced-nexus-clear-all');
+    if (clearEl && isClearAllControl(clearEl)) {
+      acknowledgeUserTranslationFilterDismissal('clear-all');
+      return;
+    }
+
+    if (isTranslationFilterChipNode(event.target)) {
+      acknowledgeUserTranslationFilterDismissal('chip');
+    }
+  }
+
   function isCarouselQuietPeriod() {
     return !!(enhancer.carouselQuietUntil && Date.now() < enhancer.carouselQuietUntil);
   }
@@ -1396,10 +4162,12 @@
     });
   }
 
-  function scheduleQuietPeriodEnd() {
+  function scheduleQuietPeriodEnd(quietMs) {
+    quietMs = typeof quietMs === 'number' && quietMs > 0 ? quietMs : 3500;
     if (enhancer.carouselQuietTimer) {
       clearTimeout(enhancer.carouselQuietTimer);
     }
+    enhancer.carouselQuietEndDelayMs = quietMs;
     enhancer.carouselQuietTimer = setTimeout(function () {
       enhancer.carouselQuietTimer = null;
       if (window.__vortexBrowseEnhancer && window.__vortexBrowseEnhancer.finalizeBrowseContextTransition) {
@@ -1414,10 +4182,13 @@
       if (window.__vortexBrowseEnhancer) {
         window.__vortexBrowseEnhancer.scheduleScan(true);
       }
-    }, 3500);
+    }, quietMs);
   }
 
   function beginCarouselQuietPeriod(durationMs) {
+    if (enhancer.userDismissedTranslationFilter) {
+      return;
+    }
     var quietMs = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 3500;
     enhancer.scanGeneration = (enhancer.scanGeneration || 0) + 1;
     enhancer.carouselQuietUntil = Date.now() + quietMs;
@@ -1430,7 +4201,68 @@
     enhancer.lastAppliedSliceKey = '';
     enhancer.catalogIndicesBootstrapped = false;
     enhancer.catalogModIdToIndex = {};
-    scheduleQuietPeriodEnd();
+    scheduleQuietPeriodEnd(quietMs);
+  }
+
+  function clearCarouselQuietPeriod() {
+    enhancer.carouselQuietUntil = 0;
+    enhancer.pendingPoolCleanup = false;
+    if (enhancer.carouselQuietTimer) {
+      clearTimeout(enhancer.carouselQuietTimer);
+      enhancer.carouselQuietTimer = null;
+    }
+  }
+
+  function handleTranslationOnlyBrowseSessionChange(nextSessionKey) {
+    traceStep('translation-filter-session-change', {
+      sessionKey: nextSessionKey,
+      href: window.location.href,
+    });
+    enhancer.poolSessionKey = nextSessionKey;
+    enhancer.filteredFillAttempts = 0;
+    enhancer.lastAppliedSliceKey = '';
+    enhancer.tilePool = [];
+    clearCarouselQuietPeriod();
+    resetNexusResultsHeadlineCache();
+    unhideAllCarouselTiles();
+    syncDismissedFilterBrowseState();
+    if (enhancer.config && enhancer.config.hideSiteChrome) {
+      applyDismissedBrowseHideChrome(enhancer.config);
+    }
+    prepareDismissedCarouselBrowse(enhancer.config || {});
+    if (window.__vortexBrowseEnhancer) {
+      window.__vortexBrowseEnhancer.scheduleScan(true);
+      [500, 1200, 2500].forEach(function (delay) {
+        setTimeout(function () {
+          if (getBrowseSessionKey() !== nextSessionKey) {
+            return;
+          }
+          if (isBrowseOopsPage()) {
+            traceStep('translation-filter-session-oops-recovery', {
+              delay: delay,
+              href: window.location.href,
+            });
+            recoverFromBrowseOopsIfNeeded();
+            return;
+          }
+          var grid = findModGrid();
+          var liveTiles = grid ? grid.querySelectorAll('[data-e2eid="mod-tile"]').length : 0;
+          traceStep('translation-filter-session-retry', {
+            delay: delay,
+            liveTiles: liveTiles,
+          });
+          clearBrowseLayoutCollapseMarks();
+          unhideAllCarouselTiles();
+          ensureDismissedBrowseChromeSafe();
+          ensureCarouselControlsBar();
+          protectBrowseControlsFromChromeHide();
+          hideBrowsePageFooter();
+          if (!liveTiles) {
+            window.__vortexBrowseEnhancer.scheduleScan(true);
+          }
+        }, delay);
+      });
+    }
   }
 
   function scanLightDuringQuiet(config) {
@@ -1513,9 +4345,172 @@
     }
   }
 
-  function urlHasActiveNexusFilters(href) {
+  function getActiveBrowseHref() {
     try {
-      var url = new URL(href || window.location.href);
+      if (isBrowseModsListPathname(getBrowsePathname()) &&
+          window.location.href.indexOf('nexusmods.com') >= 0) {
+        return window.location.href;
+      }
+    } catch (errActiveHref) {
+      // ignore
+    }
+    var config = enhancer.config || {};
+    if (config.browseHref && String(config.browseHref).indexOf('nexusmods.com') >= 0) {
+      return String(config.browseHref);
+    }
+    return window.location.href;
+  }
+
+  function isFilteredBrowseSession(config) {
+    config = config || enhancer.config || {};
+    if (enhancer.clientSideNumericFilterActive) {
+      return true;
+    }
+    if (hasNumericNexusBrowseFilters() || hasVisibleNexusFilterChipText()) {
+      return true;
+    }
+    if (enhancer.filteredBrowseEngaged || enhancer.domFilterBrowseActive) {
+      return hasNumericNexusBrowseFilters() ||
+        hasVisibleNexusFilterChipText() ||
+        urlHasMeaningfulNexusFilters();
+    }
+    if (hasDomActiveNexusFilters()) {
+      return true;
+    }
+    if (enhancer.nexusFilterApplyInFlight && enhancer.pendingNexusFilterUrl &&
+        urlHasMeaningfulNexusFilters(enhancer.pendingNexusFilterUrl)) {
+      return true;
+    }
+    if (urlHasMeaningfulNexusFilters(window.location.href)) {
+      return true;
+    }
+    if (config.filterBrowseActive && urlHasMeaningfulNexusFilters()) {
+      return true;
+    }
+    return urlHasMeaningfulNexusFilters(getActiveBrowseHref());
+  }
+
+  function shouldTakeFilteredBrowseFastPath(config) {
+    if (!config || !isBrowseModsListPathname(getBrowsePathname())) {
+      return false;
+    }
+    if (hasNumericNexusBrowseFilters()) {
+      return false;
+    }
+    if (enhancer.nexusFilterApplyInFlight) {
+      return true;
+    }
+    return isFilteredBrowseSession(config) && shouldUseFilteredBrowseLightScan(config);
+  }
+
+  function runFilteredBrowseFastScan(config) {
+    ensureStyles();
+    restoreMainBrowseContentVisibility();
+    applyHideSiteChrome(config);
+    hideNexusItemsPerPageUi();
+    tagNexusPaginationNav();
+    var stats = executeFilteredBrowseLightScan(config, { nested: true });
+    logToHost('scanFilteredBrowseLight done', {
+      stats: stats,
+      state: summarizeFilteredBrowseState(config),
+      filterApplyInFlight: !!enhancer.nexusFilterApplyInFlight,
+    });
+    return attachHostLogs(stats, config);
+  }
+
+  function shouldUseFilteredBrowseLightScanPath(config) {
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return false;
+    }
+    if (enhancer.nexusFilterApplyInFlight && enhancer.pendingNexusFilterUrl) {
+      return true;
+    }
+    if (urlHasActiveNexusFilters(window.location.href)) {
+      return true;
+    }
+    return !!(config && isFilteredBrowseSession(config) && shouldUseFilteredBrowseLightScan(config));
+  }
+
+  function executeFilteredBrowseLightScan(config, options) {
+    options = options || {};
+    if (enhancer.filteredBrowseLightScanInFlight && !options.nested) {
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    if (enhancer.scanInProgress && !options.nested) {
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    var acquired = false;
+    if (!enhancer.scanInProgress) {
+      enhancer.scanInProgress = true;
+      acquired = true;
+    }
+    enhancer.filteredBrowseLightScanInFlight = true;
+    try {
+      return scanFilteredBrowseLight(config);
+    } finally {
+      enhancer.filteredBrowseLightScanInFlight = false;
+      if (acquired) {
+        enhancer.scanInProgress = false;
+      }
+    }
+  }
+
+  function executeBrowseScan(config) {
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return attachHostLogs(runNumericFilteredBrowseScanPath(config), config);
+    }
+    if (shouldUseFilteredBrowseLightScanPath(config)) {
+      return attachHostLogs(executeFilteredBrowseLightScan(config), config);
+    }
+    return scan(config);
+  }
+
+  function urlParamCountsAsNexusFilter(key, url) {
+    if (key === 'count' || key === 'page' || key === 'p' || key === 'offset') {
+      return false;
+    }
+    if (/^sort/i.test(key) || key === 'direction' || key === 'order') {
+      return false;
+    }
+    if (key === 'excludedTag') {
+      var tags = url.searchParams.getAll('excludedTag');
+      return !(tags.length === 1 && /^translation$/i.test(String(tags[0])));
+    }
+    return true;
+  }
+
+  function urlHasMeaningfulNexusFilters(href) {
+    if (href === undefined || href === null || href === '') {
+      href = getActiveBrowseHref();
+    }
+    try {
+      var url = new URL(href || getActiveBrowseHref());
+      var seen = {};
+      var found = false;
+      url.searchParams.forEach(function (_, key) {
+        if (found || seen[key]) {
+          return;
+        }
+        seen[key] = true;
+        if (urlParamCountsAsNexusFilter(key, url)) {
+          found = true;
+        }
+      });
+      return found;
+    } catch (errMeaningfulFilters) {
+      return false;
+    }
+  }
+
+  function urlHasActiveNexusFilters(href) {
+    if (href === undefined || href === null || href === '') {
+      if (enhancer.config && enhancer.config.filterBrowseActive) {
+        return true;
+      }
+      href = getActiveBrowseHref();
+    }
+    try {
+      var url = new URL(href || getActiveBrowseHref());
       var seen = {};
       var keys = [];
       url.searchParams.forEach(function (_, key) {
@@ -1526,17 +4521,7 @@
       });
 
       return keys.some(function (key) {
-        if (key === 'count' || key === 'page' || key === 'p' || key === 'offset') {
-          return false;
-        }
-        if (/^sort/i.test(key) || key === 'direction' || key === 'order') {
-          return false;
-        }
-        if (key === 'excludedTag') {
-          var tags = url.searchParams.getAll('excludedTag');
-          return !(tags.length === 1 && tags[0] === 'Translation');
-        }
-        return true;
+        return urlParamCountsAsNexusFilter(key, url);
       });
     } catch (errFilters) {
       return false;
@@ -1614,7 +4599,7 @@
       return false;
     }
 
-    var needsTranslation = !!(enhancer.clientHideTranslations || enhancer.forceDefaultFilters);
+    var needsTranslation = shouldApplyTranslationFilter();
     var hasTranslation = translationFilterExcludedInUrl();
     var urlCount = getPageSizeFromUrl();
     var targetSize = enhancer.nexusPageSizeTarget || 80;
@@ -1643,7 +4628,7 @@
     if (shouldDeferNexusUrlMutation()) {
       return false;
     }
-    if (!enhancer.clientHideTranslations && !enhancer.forceDefaultFilters) {
+    if (!shouldApplyTranslationFilter()) {
       return false;
     }
     if (translationFilterExcludedInUrl()) {
@@ -1712,6 +4697,9 @@
   }
 
   function isNexusHideTranslationsActive() {
+    if (enhancer.userDismissedTranslationFilter) {
+      return translationFilterExcludedInUrl();
+    }
     if (translationFilterExcludedInUrl()) {
       return true;
     }
@@ -1726,7 +4714,19 @@
   }
 
   function hideNexusFilterAside() {
-    if (isNexusFiltersPanelOpen()) {
+    if (isDismissedCarouselBrowseMode(enhancer.config)) {
+      return;
+    }
+    if (isFilteredBrowseSession(enhancer.config)) {
+      return;
+    }
+    if (enhancer.userWantsNexusFiltersOpen) {
+      return;
+    }
+    if (isNexusFiltersPanelVisible()) {
+      return;
+    }
+    if (enhancer.nexusFilterCooldownUntil && Date.now() < enhancer.nexusFilterCooldownUntil) {
       return;
     }
 
@@ -1736,7 +4736,7 @@
       filtersPanel.classList.add('vortex-enhanced-browse-trim-hidden');
     }
 
-    document.querySelectorAll('aside').forEach(function (aside) {
+    document.querySelectorAll('aside, #filters-panel').forEach(function (aside) {
       if (aside.querySelector('[data-vortex-enhanced-filters="true"]')) {
         return;
       }
@@ -1943,6 +4943,70 @@
     }
   }
 
+  function getNexusResultsPageFromDom() {
+    var navs = document.querySelectorAll('.vortex-enhanced-nexus-pagination-hide, nav, [role="navigation"]');
+    for (var n = 0; n < navs.length; n++) {
+      var nav = navs[n];
+      if (!nav.querySelector('[aria-current="page"]')) {
+        continue;
+      }
+      var current = nav.querySelector('[aria-current="page"]');
+      if (!current) {
+        continue;
+      }
+      var text = (current.textContent || '').trim();
+      var parsed = parseInt(text, 10);
+      if (!isNaN(parsed) && parsed >= 1) {
+        return parsed;
+      }
+    }
+    return null;
+  }
+
+  function getActiveNexusResultsPage() {
+    var domPage = getNexusResultsPageFromDom();
+    if (domPage !== null && domPage >= 1) {
+      return domPage;
+    }
+    return getNexusResultsPageFromUrl();
+  }
+
+  function filteredNexusTilesChangedSince(startModIds, config, minFresh) {
+    minFresh = minFresh || 4;
+    if (!startModIds || Object.keys(startModIds).length < minFresh) {
+      return false;
+    }
+    var liveCards = collectLiveGridCards(config || enhancer.config || {});
+    if (liveCards.length < minFresh) {
+      return false;
+    }
+    var freshCount = 0;
+    for (var i = 0; i < liveCards.length; i++) {
+      var modId = liveCards[i].modId;
+      if (modId && !startModIds[String(modId)]) {
+        freshCount++;
+        if (freshCount >= minFresh) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function filteredNexusPageReady(targetNexusPage, startModIds, config, minTiles) {
+    minTiles = minTiles || 4;
+    var cfg = config || enhancer.config || {};
+    var liveCount = collectLiveGridCards(cfg).length;
+    if (liveCount < minTiles) {
+      return false;
+    }
+    if (getActiveNexusResultsPage() === targetNexusPage ||
+        getNexusResultsPageFromUrl() === targetNexusPage) {
+      return true;
+    }
+    return filteredNexusTilesChangedSince(startModIds, cfg, minTiles);
+  }
+
   function navigateNexusResultsPageByUrl(direction) {
     try {
       var url = new URL(window.location.href);
@@ -1978,7 +5042,8 @@
     return getNexusResultsPageFromUrl() > 1;
   }
 
-  function navigateNexusResultsPageSoft(direction) {
+  function navigateNexusResultsPageSoft(direction, options) {
+    options = options || {};
     var btn = findNexusPaginationButton(direction);
     if (!btn) {
       return false;
@@ -1987,9 +5052,10 @@
     enhancer.pendingPoolFetch = true;
     saveCarouselPagingState();
 
-    var preferSoft = shouldPreferSoftNexusPagination();
+    var forceSoft = !!(options.forceSoft || urlHasActiveNexusFilters());
+    var preferSoft = forceSoft || shouldPreferSoftNexusPagination();
     var href = btn.getAttribute('href');
-    if (!preferSoft && href && href !== '#' && href.indexOf('javascript:') !== 0) {
+    if (!forceSoft && !preferSoft && href && href !== '#' && href.indexOf('javascript:') !== 0) {
       try {
         var url = new URL(href, window.location.href);
         window.location.assign(url.toString());
@@ -2012,15 +5078,17 @@
     return true;
   }
 
-  function navigateNexusResultsPage(direction) {
+  function navigateNexusResultsPage(direction, options) {
+    options = options || {};
     var btn = findNexusPaginationButton(direction);
     if (btn) {
       enhancer.pendingPoolFetch = true;
       saveCarouselPagingState();
 
-      var preferSoft = shouldPreferSoftNexusPagination();
+      var forceSoft = !!(options.forceSoft || urlHasActiveNexusFilters());
+      var preferSoft = forceSoft || shouldPreferSoftNexusPagination();
       var href = btn.getAttribute('href');
-      if (!preferSoft && href && href !== '#' && href.indexOf('javascript:') !== 0) {
+      if (!forceSoft && !preferSoft && href && href !== '#' && href.indexOf('javascript:') !== 0) {
         try {
           var url = new URL(href, window.location.href);
           window.location.assign(url.toString());
@@ -2186,6 +5254,28 @@
     return false;
   }
 
+  function mutationAddsLiveModTiles(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var mutation = mutations[i];
+      if (!mutation.addedNodes) {
+        continue;
+      }
+      for (var a = 0; a < mutation.addedNodes.length; a++) {
+        var added = mutation.addedNodes[a];
+        if (added.nodeType !== 1) {
+          continue;
+        }
+        if (added.matches && added.matches('[data-e2eid="mod-tile"]')) {
+          return true;
+        }
+        if (added.querySelector && added.querySelector('[data-e2eid="mod-tile"]')) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function mutationTouchesOnlyEnhancerInternals(mutations) {
     for (var i = 0; i < mutations.length; i++) {
       var mutation = mutations[i];
@@ -2236,6 +5326,33 @@
     return Math.max(0, Math.ceil(visibleCount / pageSize) - 1);
   }
 
+  function isFilteredBrowsePagingLocked(options) {
+    options = options || {};
+    return !!options.forcePageApply ||
+      !!(enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil);
+  }
+
+  function clampFilteredBrowseLivePageIndex(pageSize, visibleCount, currentPage, options) {
+    if (isFilteredBrowsePagingLocked(options)) {
+      return currentPage;
+    }
+    if (enhancer.carouselAdvancePending || enhancer.pendingNativeCatalogFetch ||
+        enhancer.pendingTargetPage != null) {
+      return currentPage;
+    }
+    var config = enhancer.config;
+    var liveCount = config ? collectLiveGridCards(config).length : 0;
+    var loadedCount = Math.max(visibleCount || 0, liveCount);
+    var maxAccessiblePage = getMaxLoadedCarouselPage(pageSize, loadedCount);
+    if (currentPage <= maxAccessiblePage) {
+      return currentPage;
+    }
+    if (currentPage * pageSize < loadedCount) {
+      return currentPage;
+    }
+    return maxAccessiblePage;
+  }
+
   function clampGlobalPageIndex(pageSize, visibleCount) {
     var maxPage = getMaxLoadedCarouselPage(pageSize, visibleCount);
     if (enhancer.globalPageIndex > maxPage) {
@@ -2280,10 +5397,34 @@
   }
 
   function buildNexusResultsPageUrl(pageNum) {
-    var url = new URL(window.location.href);
+    var url = new URL(stripInternalBrowseParams(window.location.href));
+    if (!enhancer.stashedSidebarNumericFilters ||
+        !enhancer.stashedSidebarNumericFilters.length) {
+      stashSidebarNumericFilters();
+    }
     url.searchParams.set('page', String(pageNum));
     if (!url.searchParams.get('count')) {
       url.searchParams.set('count', '80');
+    }
+    // Numeric sidebar filters are client-side in the carousel, but Nexus
+    // still needs the same query parameters when requesting another page.
+    var numericFilters = enhancer.stashedSidebarNumericFilters || [];
+    for (var nf = 0; nf < numericFilters.length; nf++) {
+      var numericEntry = numericFilters[nf];
+      if (!numericEntry || !numericEntry.value) {
+        continue;
+      }
+      var numericLabel = String(numericEntry.name || '') + ' ' +
+        String(numericEntry.rowText || '');
+      if (/max(?:imum)?\s+downloads?/i.test(numericLabel)) {
+        url.searchParams.set('maxDownloads', String(numericEntry.value));
+      } else if (/min(?:imum)?\s+downloads?/i.test(numericLabel)) {
+        url.searchParams.set('minDownloads', String(numericEntry.value));
+      } else if (/max(?:imum)?\s+endorsements?/i.test(numericLabel)) {
+        url.searchParams.set('maxEndorsements', String(numericEntry.value));
+      } else if (/min(?:imum)?\s+endorsements?/i.test(numericLabel)) {
+        url.searchParams.set('minEndorsements', String(numericEntry.value));
+      }
     }
     return url.toString();
   }
@@ -2291,6 +5432,11 @@
   function markCurrentNexusPageFetched() {
     var page = getNexusResultsPageFromUrl();
     var ctx = loadNexusListingContext();
+    if (urlHasActiveNexusFilters() && page > 1 && !filteredBrowseHasEnoughCatalog()) {
+      if (!(enhancer.nativeMergedPages && enhancer.nativeMergedPages[page])) {
+        return;
+      }
+    }
     if (!isGraphqlSupportedBrowseSort(ctx)) {
       if (page > 1 && !(enhancer.nativeMergedPages && enhancer.nativeMergedPages[page])) {
         return;
@@ -2334,7 +5480,2195 @@
     });
   }
 
-  function parseModTilesFromHtml(html, baseUrl) {
+  function isGraphqlModNodeShape(node) {
+    return !!(node && node.modId != null && node.name);
+  }
+
+  function findGraphqlModNodesInObject(obj, depth) {
+    depth = depth || 0;
+    if (!obj || depth > 14) {
+      return [];
+    }
+    if (Array.isArray(obj)) {
+      if (obj.length >= 4 && isGraphqlModNodeShape(obj[0])) {
+        return obj;
+      }
+      var merged = [];
+      for (var i = 0; i < obj.length; i++) {
+        var inner = findGraphqlModNodesInObject(obj[i], depth + 1);
+        if (inner.length > merged.length) {
+          merged = inner;
+        }
+      }
+      return merged;
+    }
+    if (typeof obj === 'object') {
+      if (Array.isArray(obj.nodes) && obj.nodes.length >= 4 && isGraphqlModNodeShape(obj.nodes[0])) {
+        return obj.nodes;
+      }
+      var keys = Object.keys(obj);
+      for (var k = 0; k < keys.length; k++) {
+        var found = findGraphqlModNodesInObject(obj[keys[k]], depth + 1);
+        if (found.length >= 8) {
+          return found;
+        }
+      }
+    }
+    return [];
+  }
+
+  function parseGraphqlModNodesFromNextHtml(html) {
+    if (!html) {
+      return [];
+    }
+    var match = html.match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!match || !match[1]) {
+      return [];
+    }
+    try {
+      return findGraphqlModNodesInObject(JSON.parse(match[1]));
+    } catch (errNextData) {
+      return [];
+    }
+  }
+
+  function readNextDataRoot() {
+    try {
+      var nextData = document.getElementById('__NEXT_DATA__');
+      if (!nextData || !nextData.textContent) {
+        return null;
+      }
+      return JSON.parse(nextData.textContent);
+    } catch (errNextRoot) {
+      return null;
+    }
+  }
+
+  function looksLikeModsListingVariables(obj) {
+    if (!obj || typeof obj !== 'object') {
+      return false;
+    }
+    if (obj.count == null && obj.offset == null) {
+      return false;
+    }
+    if (!obj.filter && !obj.postFilter) {
+      return false;
+    }
+    var filter = obj.filter || {};
+    return !!(filter.gameDomainName || filter.downloads || filter.endorsements ||
+      filter.fileSize || filter.name || filter.filter || obj.postFilter);
+  }
+
+  function findModsListingVariablesInObject(obj, depth, best) {
+    depth = depth || 0;
+    best = best || { score: 0, value: null };
+    if (!obj || depth > 18) {
+      return best;
+    }
+    if (looksLikeModsListingVariables(obj)) {
+      var score = 1;
+      if (obj.filter && obj.filter.downloads) {
+        score += 4;
+      }
+      if (obj.postFilter && obj.postFilter.downloads) {
+        score += 3;
+      }
+      if (obj.filter && obj.filter.gameDomainName) {
+        score += 2;
+      }
+      if (obj.sort) {
+        score += 1;
+      }
+      if (score >= best.score) {
+        best.score = score;
+        best.value = obj;
+      }
+    }
+    if (Array.isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+        findModsListingVariablesInObject(obj[i], depth + 1, best);
+      }
+      return best;
+    }
+    if (typeof obj === 'object') {
+      var keys = Object.keys(obj);
+      for (var k = 0; k < keys.length; k++) {
+        findModsListingVariablesInObject(obj[keys[k]], depth + 1, best);
+      }
+    }
+    return best;
+  }
+
+  function cloneJson(value) {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (errClone) {
+      return null;
+    }
+  }
+
+  function extractNexusPageModsListingVariables() {
+    var root = readNextDataRoot();
+    if (!root) {
+      return null;
+    }
+    var found = findModsListingVariablesInObject(root, 0, { score: 0, value: null });
+    return found && found.value ? cloneJson(found.value) : null;
+  }
+
+  function filteredBrowseNeedsNativeBatch(pageSize, catalogCount) {
+    if (!urlHasActiveNexusFilters()) {
+      return false;
+    }
+    if (filteredBrowseHasEnoughCatalog()) {
+      return false;
+    }
+    if (!getNextUnfetchedNexusPage()) {
+      return false;
+    }
+    var currentPage = enhancer.globalPageIndex || 0;
+    if (currentPage < 2) {
+      return false;
+    }
+    var neededForNextPage = (currentPage + 2) * pageSize;
+    return catalogCount < neededForNextPage;
+  }
+
+  function filteredBrowseBatchCatalogThreshold() {
+    return 81;
+  }
+
+  function filteredBrowseHasEnoughCatalog(config) {
+    config = config || enhancer.config || {};
+    if (getVisibleCarouselCatalogCount(config) >= filteredBrowseBatchCatalogThreshold()) {
+      return true;
+    }
+    return !!(enhancer.tilePool && enhancer.tilePool.length >= filteredBrowseBatchCatalogThreshold());
+  }
+
+  function appendLiveGridClonesToPool(config) {
+    var live = collectLiveGridCards(config);
+    if (!live.length) {
+      return 0;
+    }
+    var seen = {};
+    for (var p = 0; p < enhancer.tilePool.length; p++) {
+      if (enhancer.tilePool[p].modId) {
+        seen[String(enhancer.tilePool[p].modId)] = true;
+      }
+    }
+    var freshTiles = [];
+    for (var i = 0; i < live.length; i++) {
+      var modId = live[i].modId;
+      if (!modId || seen[String(modId)]) {
+        continue;
+      }
+      seen[String(modId)] = true;
+      var clone = live[i].card.cloneNode(true);
+      clone.setAttribute('data-vortex-pool-tile', 'true');
+      freshTiles.push(clone);
+    }
+    if (!freshTiles.length) {
+      return 0;
+    }
+    return appendFetchedTilesToPool(freshTiles, config);
+  }
+
+  function ensureFilteredBrowsePageOnePooled(config) {
+    if (!browseUsesFilteredCatalogPaging()) {
+      return Promise.resolve(false);
+    }
+    return ensureFilteredBrowseOnPageOne().then(function (onPageOne) {
+      if (!onPageOne) {
+        return false;
+      }
+      if (enhancer.filteredBrowsePageOnePooled) {
+        return true;
+      }
+      var live = collectLiveGridCards(config);
+      if (live.length < 4) {
+        return live.length >= Math.min(12, getCarouselPageSize(config));
+      }
+      appendLiveGridClonesToPool(config);
+      enhancer.filteredBrowsePageOnePooled = true;
+      saveNativePoolSnapshot(config);
+      return true;
+    });
+  }
+
+  function finishFilteredBrowseHostBatch(ok) {
+    var resolve = enhancer.filteredBrowseHostBatchResolver;
+    if (enhancer.filteredBrowseHostBatchTimeoutId) {
+      clearTimeout(enhancer.filteredBrowseHostBatchTimeoutId);
+      enhancer.filteredBrowseHostBatchTimeoutId = null;
+    }
+    enhancer.filteredBrowseHostBatchResolver = null;
+    enhancer.filteredBrowseHostBatchInFlight = false;
+    enhancer.filteredBrowseHostBatchPhase = '';
+    enhancer.filteredBrowseHostBatchReturnUrl = '';
+    enhancer.pendingNativeCatalogFetch = false;
+    enhancer.pendingPoolFetch = false;
+    enhancer.nativeNavFetchInFlight = false;
+    enhancer.nativeNavFetchTargetPage = null;
+    enhancer.fetchInFlightPage = null;
+    enhancer.dismissedBatchPrefetchInFlight = false;
+    if (resolve) {
+      resolve(!!ok);
+    }
+    if (window.__vortexBrowseEnhancer) {
+      setTimeout(function () {
+        if (window.__vortexBrowseEnhancer) {
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        }
+      }, 0);
+    }
+  }
+
+  function handleFilteredBrowseHostBatchScan(config) {
+    if (!enhancer.filteredBrowseHostBatchInFlight) {
+      return;
+    }
+    var pageNum = enhancer.nativeNavFetchTargetPage || 2;
+    var urlPage = getNexusResultsPageFromUrl();
+    var phase = enhancer.filteredBrowseHostBatchPhase;
+    var minFreshTiles = 4;
+
+    if (phase === 'forward') {
+      var liveCards = collectLiveGridCards(config);
+      if (liveCards.length < minFreshTiles && urlPage < pageNum) {
+        if (enhancer.filteredBrowseHostBatchDeadline &&
+            Date.now() > enhancer.filteredBrowseHostBatchDeadline) {
+          finishFilteredBrowseHostBatch(false);
+          navigateBrowseUrlViaHost(enhancer.filteredBrowseHostBatchReturnUrl || buildNexusResultsPageUrl(1));
+        }
+        return;
+      }
+      var added = mergeLiveGridIntoPool(config);
+      if (added < minFreshTiles && urlPage < pageNum) {
+        return;
+      }
+      markNativeMergedPage(pageNum);
+      enhancer.fetchedNexusPages = enhancer.fetchedNexusPages || {};
+      enhancer.fetchedNexusPages[pageNum] = true;
+      enhancer.lastAppliedSliceKey = '';
+      saveNativePoolSnapshot(config);
+      enhancer.filteredBrowseHostBatchPhase = 'back';
+      navigateBrowseUrlViaHost(enhancer.filteredBrowseHostBatchReturnUrl || buildNexusResultsPageUrl(1));
+      return;
+    }
+
+    if (phase === 'back' && urlPage <= 1) {
+      var liveOnReturn = collectLiveGridCards(config).length;
+      if (liveOnReturn < minFreshTiles &&
+          enhancer.filteredBrowseHostBatchDeadline &&
+          Date.now() < enhancer.filteredBrowseHostBatchDeadline) {
+        return;
+      }
+      finishFilteredBrowseHostBatch(filteredBrowseHasEnoughCatalog(config));
+    }
+  }
+
+  function fetchFilteredBrowseBatchViaHostNav(pageNum, config) {
+    if (pageNum !== 2 || !browseUsesFilteredCatalogPaging()) {
+      return Promise.resolve(false);
+    }
+    if (enhancer.filteredBrowseHostBatchInFlight || enhancer.nativeNavFetchInFlight) {
+      return Promise.resolve(false);
+    }
+
+    return ensureFilteredBrowsePageOnePooled(config).then(function (seeded) {
+      if (!seeded) {
+        return false;
+      }
+
+      saveNativePoolSnapshot(config);
+      enhancer.filteredBrowseHostBatchInFlight = true;
+      enhancer.filteredBrowseHostBatchPhase = 'forward';
+      enhancer.filteredBrowseHostBatchReturnUrl = stripInternalBrowseParams(window.location.href);
+      enhancer.filteredBrowseHostBatchDeadline = Date.now() + 35000;
+      enhancer.pendingNativeCatalogFetch = true;
+      enhancer.nativeNavFetchInFlight = true;
+      enhancer.nativeNavFetchTargetPage = pageNum;
+      enhancer.pendingPoolFetch = true;
+
+      return new Promise(function (resolve) {
+        enhancer.filteredBrowseHostBatchResolver = resolve;
+        enhancer.filteredBrowseHostBatchTimeoutId = setTimeout(function () {
+          if (enhancer.filteredBrowseHostBatchResolver) {
+            finishFilteredBrowseHostBatch(false);
+            navigateBrowseUrlViaHost(enhancer.filteredBrowseHostBatchReturnUrl || buildNexusResultsPageUrl(1));
+          }
+        }, 36000);
+
+        if (!navigateBrowseUrlViaHost(buildNexusResultsPageUrl(pageNum))) {
+          finishFilteredBrowseHostBatch(false);
+        }
+      });
+    });
+  }
+
+  function clearStaleFilteredBatchFetchFlags() {
+    if (!urlHasActiveNexusFilters() || filteredBrowseHasEnoughCatalog()) {
+      return;
+    }
+    if (enhancer.fetchedNexusPages && enhancer.fetchedNexusPages[2]) {
+      delete enhancer.fetchedNexusPages[2];
+    }
+    if (enhancer.nativeMergedPages && enhancer.nativeMergedPages[2]) {
+      delete enhancer.nativeMergedPages[2];
+    }
+  }
+
+  function hasFilteredBrowseBatchLoaded() {
+    if (!isFilteredBrowseSession()) {
+      return false;
+    }
+    return filteredBrowseHasEnoughCatalog();
+  }
+
+  function filteredBrowseUsesLiveCatalogOnly() {
+    return isFilteredBrowseSession() && !hasFilteredBrowseBatchLoaded();
+  }
+
+  function resetFilteredCarouselCatalog() {
+    enhancer.filteredCarouselCatalog = [];
+    enhancer.filteredCarouselCatalogSessionKey = '';
+  }
+
+  function getFilteredCarouselCatalogSessionKey(config) {
+    return getBrowseSessionKey() + '|' + getFilterCarouselConfigKey(config);
+  }
+
+  function mergeFilteredPoolIntoCarouselCatalog(config) {
+    if (hasNumericNexusBrowseFilters() && filteredBrowseUsesLiveCatalogOnly()) {
+      return 0;
+    }
+    if (!config || !isFilteredBrowseSession(config) || !enhancer.tilePool || !enhancer.tilePool.length) {
+      return 0;
+    }
+    var sessionKey = getBrowseSessionKey();
+    if (enhancer.filteredBrowsePoolSessionKey && enhancer.filteredBrowsePoolSessionKey !== sessionKey) {
+      return 0;
+    }
+    return mergeIntoFilteredCarouselCatalog(enhancer.tilePool, config);
+  }
+
+  function mergeIntoFilteredCarouselCatalog(cards, config) {
+    if (!config || !cards || !cards.length) {
+      return 0;
+    }
+    if (!isFilteredBrowseSession(config) &&
+        !config.filterBrowseActive &&
+        !enhancer.domFilterBrowseActive &&
+        !hasSidebarDownloadsFilterApplied()) {
+      return 0;
+    }
+    var sessionKey = getFilteredCarouselCatalogSessionKey(config);
+    if (enhancer.filteredCarouselCatalogSessionKey !== sessionKey) {
+      enhancer.filteredCarouselCatalog = [];
+      enhancer.filteredCarouselCatalogSessionKey = sessionKey;
+    }
+    applyFilters(cards, config);
+    var visible = sortCatalogEntries(getVisibleCarouselCards(cards));
+    var seen = {};
+    var catalog = enhancer.filteredCarouselCatalog || [];
+    for (var i = 0; i < catalog.length; i++) {
+      if (catalog[i].modId) {
+        seen[String(catalog[i].modId)] = true;
+      }
+    }
+    var added = 0;
+    for (var j = 0; j < visible.length; j++) {
+      var entry = visible[j];
+      if (!entry.modId || seen[String(entry.modId)]) {
+        continue;
+      }
+      seen[String(entry.modId)] = true;
+      catalog.push(entry);
+      added++;
+    }
+    enhancer.filteredCarouselCatalog = catalog;
+    return added;
+  }
+
+  function ensureFilteredCarouselCatalogFromLive(config) {
+    if (!config) {
+      return 0;
+    }
+    if (!isFilteredBrowseSession(config) &&
+        !config.filterBrowseActive &&
+        !enhancer.domFilterBrowseActive &&
+        !hasSidebarDownloadsFilterApplied()) {
+      return (enhancer.filteredCarouselCatalog || []).length;
+    }
+    var live = collectLiveGridCards(config);
+    if (!live.length) {
+      return (enhancer.filteredCarouselCatalog || []).length;
+    }
+    var sessionKey = getFilteredCarouselCatalogSessionKey(config);
+    var catalog = enhancer.filteredCarouselCatalog || [];
+    if (enhancer.filteredCarouselCatalogSessionKey !== sessionKey) {
+      catalog = [];
+      enhancer.filteredCarouselCatalog = catalog;
+      enhancer.filteredCarouselCatalogSessionKey = sessionKey;
+    }
+    if (catalog.length < live.length) {
+      mergeIntoFilteredCarouselCatalog(live, config);
+    }
+    return (enhancer.filteredCarouselCatalog || []).length;
+  }
+
+  function getFilteredCarouselVisibleEntries(config) {
+    if (enhancer.resolvingFilteredCarouselVisibleEntries) {
+      return enhancer.filteredCarouselCatalog || [];
+    }
+    enhancer.resolvingFilteredCarouselVisibleEntries = true;
+    try {
+      config = config || enhancer.config;
+      if (hasNumericNexusBrowseFilters()) {
+        return buildNumericFilteredLiveCatalog(config);
+      }
+      ensureFilteredCarouselCatalogFromLive(config);
+      mergeIntoFilteredCarouselCatalog(collectLiveGridCards(config), config);
+      mergeFilteredPoolIntoCarouselCatalog(config);
+      if (!filteredBrowseUsesLiveCatalogOnly()) {
+        mergeIntoFilteredCarouselCatalog(collectCards(config), config);
+      }
+      return enhancer.filteredCarouselCatalog || [];
+    } finally {
+      enhancer.resolvingFilteredCarouselVisibleEntries = false;
+    }
+  }
+
+  function appendFilteredGraphqlBatchToCatalog(result, config, pageNum) {
+    if (!result || !result.nodes || !result.nodes.length) {
+      return false;
+    }
+    var nodes = filterFreshGraphqlNodes(result.nodes, config, { minFresh: 1, allowFallback: true });
+    if (!nodes.length) {
+      return false;
+    }
+    var tiles = [];
+    for (var i = 0; i < nodes.length; i++) {
+      tiles.push(buildGraphQLModTile(nodes[i]));
+    }
+    var cards = [];
+    for (var t = 0; t < tiles.length; t++) {
+      var modId = extractModIdFromTile(tiles[t]);
+      cards.push({ card: tiles[t], modId: modId });
+    }
+    mergeIntoFilteredCarouselCatalog(cards, config);
+    appendFetchedTilesToPool(tiles, config);
+    enhancer.fetchedNexusPages = enhancer.fetchedNexusPages || {};
+    enhancer.fetchedNexusPages[pageNum] = true;
+    if (typeof result.totalCount === 'number' && result.totalCount > 0) {
+      enhancer.nexusFilteredGraphqlTotal = result.totalCount;
+      enhancer.nexusFilteredGraphqlTotalSessionKey = getBrowseSessionKey();
+      lockNexusFilteredDisplayTotal(result.totalCount);
+    }
+    return cards.length > 0;
+  }
+
+  function fetchMoreFilteredCarouselMods(config, targetPage) {
+    if (enhancer.clientSideNumericFilterActive) {
+      return fetchMoreClientSideNumericCarouselMods(config, targetPage);
+    }
+    if (hasNumericNexusBrowseFilters()) {
+      var numericNextPage = getNextUnfetchedNexusPage() || 2;
+      return fetchFilteredBrowseBatchViaSoftNav(numericNextPage, config).then(function (ok) {
+        if (ok) {
+          mergeFilteredPoolIntoCarouselCatalog(config);
+        }
+        return !!ok;
+      });
+    }
+    if (isUserInteractingWithNexusFilters() || enhancer.nexusFilterApplyInFlight) {
+      return Promise.resolve(false);
+    }
+    var pageSize = getCarouselPageSize(config);
+    var needCount = (targetPage + 1) * pageSize;
+    var loadedCount = hasNumericNexusBrowseFilters()
+      ? Math.max(
+        (enhancer.filteredCarouselCatalog || []).length,
+        document.querySelectorAll(
+          'main [data-e2eid="mod-tile"]:not([data-vortex-pool-tile]), ' +
+          '#mainContent [data-e2eid="mod-tile"]:not([data-vortex-pool-tile])'
+        ).length
+      )
+      : getFilteredCarouselVisibleEntries(config).length;
+    if (loadedCount >= needCount) {
+      return Promise.resolve(true);
+    }
+    var nextNexusPage = getNextUnfetchedNexusPage() || 2;
+    var offset = (nextNexusPage - 1) * 80;
+
+    function finishFilteredFetch(ok) {
+      if (ok) {
+        mergeIntoFilteredCarouselCatalog(collectLiveGridCards(config), config);
+        mergeFilteredPoolIntoCarouselCatalog(config);
+      }
+      return ok;
+    }
+
+    if (browseUsesFilteredCatalogPaging()) {
+      return fetchFilteredBrowseBatchPage(
+        nextNexusPage,
+        config,
+        offset,
+        'soft',
+        finishFilteredFetch,
+        function (result) {
+          return appendFilteredGraphqlBatchToCatalog(result, config, nextNexusPage);
+        }
+      );
+    }
+
+    return fetchFilteredBrowseBatchViaSoftNav(nextNexusPage, config).then(finishFilteredFetch);
+  }
+
+  function resetFilteredBrowseCatalogState() {
+    enhancer.tilePool = [];
+    enhancer.fetchedNexusPages = {};
+    enhancer.nativeMergedPages = {};
+    enhancer.catalogModIdToIndex = {};
+    enhancer.catalogIndicesBootstrapped = false;
+    enhancer.filteredBrowsePoolSessionKey = '';
+    enhancer.filteredBrowseStableSessionKey = '';
+    enhancer.filteredBrowsePageOnePooled = false;
+    enhancer.filteredBrowseHostBatchInFlight = false;
+    enhancer.filteredBrowseHostBatchPhase = '';
+    enhancer.pendingNativeCatalogFetch = false;
+    enhancer.nativeNavFetchInFlight = false;
+    enhancer.pendingPoolFetch = false;
+    enhancer.fetchInFlightPage = null;
+    enhancer.carouselAdvancePending = false;
+    enhancer.dismissedBatchPrefetchInFlight = false;
+    enhancer.globalPageIndex = 0;
+    enhancer.batchPageIndex = 0;
+    enhancer.lastAppliedSliceKey = '';
+    enhancer.nativePoolRestorePromise = null;
+    enhancer.dismissedPoolRestorePromise = null;
+    resetFilteredCarouselCatalog();
+    unhideAllCarouselTiles();
+    try {
+      document.querySelectorAll(
+        '#vortex-enhanced-pool-host [data-vortex-catalog-index], #vortex-enhanced-live-stash [data-vortex-catalog-index]'
+      ).forEach(function (node) {
+        node.removeAttribute('data-vortex-catalog-index');
+      });
+    } catch (errClearCatalogIdx) {
+      // ignore
+    }
+    clearFilteredBrowsePoolSnapshot();
+    try {
+      sessionStorage.removeItem(getDismissedPoolStorageKey());
+    } catch (errClearDismissedPool) {
+      // ignore
+    }
+    saveCarouselPagingState();
+  }
+
+  function clearFilteredBrowsePoolSnapshot() {
+    try {
+      sessionStorage.removeItem(getNativePoolStorageKey());
+    } catch (errClearPool) {
+      // ignore
+    }
+  }
+
+  function ensureFilteredBrowsePoolSeeded(config) {
+    if (!browseUsesFilteredCatalogPaging()) {
+      return;
+    }
+    var sessionKey = getBrowseSessionKey();
+    if (enhancer.filteredBrowsePoolSessionKey === sessionKey) {
+      return;
+    }
+    var liveCount = collectLiveGridCards(config).length;
+    if (liveCount < 12) {
+      return;
+    }
+    enhancer.filteredBrowsePoolSessionKey = sessionKey;
+    enhancer.filteredBrowseStableSessionKey = '';
+    enhancer.filteredBrowsePageOnePooled = false;
+    clearFilteredBrowsePoolSnapshot();
+    markCurrentNexusPageFetched();
+  }
+
+  function collectLiveModIdSet(config) {
+    var ids = {};
+    collectLiveGridCards(config).forEach(function (entry) {
+      if (entry && entry.modId) {
+        ids[String(entry.modId)] = true;
+      }
+    });
+    return ids;
+  }
+
+  function buildFilteredBatchGraphqlVariables(offset, count, config) {
+    var pageVars = extractNexusPageModsListingVariables();
+    var ctx = loadNexusListingContext();
+    var activeVars = buildModsListingVariables(offset, count || 80, ctx, config);
+    var variables;
+    if (pageVars) {
+      variables = cloneJson(pageVars);
+    } else {
+      variables = activeVars;
+    }
+    variables.offset = offset;
+    variables.count = count || 80;
+    if (!variables.filter) {
+      variables.filter = {};
+    }
+    if (!variables.postFilter) {
+      variables.postFilter = {};
+    }
+    // __NEXT_DATA__ can still contain the previous listing variables while
+    // Nexus is applying a sidebar change. Always overlay the current URL
+    // constraints so prefetch/total requests cannot drop adult/category/tag
+    // filters and replace the correct result set with the full catalog.
+    variables.facets = activeVars.facets;
+    [
+      'adultContent',
+      'gameDomainName',
+      'hasUpdated',
+      'supportsVortex',
+      'name',
+    ].forEach(function (key) {
+      variables.filter[key] = activeVars.filter[key] || [];
+    });
+    variables.postFilter.tag = activeVars.postFilter.tag || [];
+    if (activeVars.postFilter.categoryName) {
+      variables.postFilter.categoryName = activeVars.postFilter.categoryName;
+    } else {
+      delete variables.postFilter.categoryName;
+    }
+    applyNexusUrlNumericFilters(variables.filter);
+    applyActiveFilterChipNumericFilters(variables.filter);
+    applyActiveFilterChipNumericFilters(variables.postFilter);
+    applySidebarNumericFiltersToGraphql(variables.filter);
+    return variables;
+  }
+
+  function applySidebarNumericFilterEntryToGraphql(filter, rowText, name, parsed) {
+    if (!filter || !Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+    var context = String(name || '') + ' ' + String(rowText || '');
+    if (/download/i.test(rowText) || /download/i.test(name)) {
+      if (/max|to|upper|less|lte|under|up to/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'downloads', 'LTE', parsed);
+      } else if (/min|from|lower|greater|gte|over|at least/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'downloads', 'GTE', parsed);
+      } else {
+        pushGraphqlIntFilter(filter, 'downloads', 'LTE', parsed);
+      }
+    } else if (/endorse/i.test(rowText) || /endorse/i.test(name)) {
+      if (/max|to|upper|less|lte|under|up to/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'endorsements', 'LTE', parsed);
+      } else if (/min|from|lower|greater|gte|over|at least/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'endorsements', 'GTE', parsed);
+      }
+    } else if (/file\s*size|filesize|\bsize\b/i.test(rowText) || /file\s*size|filesize|\bsize\b/i.test(name)) {
+      if (/max|to|upper|less|lte|under|up to/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'fileSize', 'LTE', parsed);
+      } else if (/min|from|lower|greater|gte|over|at least/i.test(context)) {
+        pushGraphqlIntFilter(filter, 'fileSize', 'GTE', parsed);
+      }
+    }
+  }
+
+  function applySidebarNumericFiltersToGraphql(filter) {
+    if (!filter) {
+      return;
+    }
+    var appliedFromPanel = false;
+    var panel = document.getElementById('filters-panel') || findNexusFilterAside();
+    if (panel) {
+      var inputs = panel.querySelectorAll('input');
+      for (var i = 0; i < inputs.length; i++) {
+        var input = inputs[i];
+        if (!input || input.type === 'checkbox' || input.type === 'radio' || input.type === 'hidden') {
+          continue;
+        }
+        var row = input.closest('section, fieldset, label, div');
+        var rowText = normalizeUiText(row && row.textContent || '').slice(0, 160);
+        var name = normalizeUiText(
+          input.getAttribute('name') ||
+          input.getAttribute('aria-label') ||
+          input.getAttribute('placeholder') ||
+          ''
+        );
+        var raw = normalizeUiText(input.value || '').replace(/,/g, '');
+        if (!raw) {
+          continue;
+        }
+        var parsed = parseInt(raw, 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          continue;
+        }
+        appliedFromPanel = true;
+        applySidebarNumericFilterEntryToGraphql(filter, rowText, name, parsed);
+      }
+    }
+    if (appliedFromPanel) {
+      return;
+    }
+    var stashed = enhancer.stashedSidebarNumericFilters || [];
+    for (var s = 0; s < stashed.length; s++) {
+      var entry = stashed[s];
+      if (!entry || !entry.value) {
+        continue;
+      }
+      applySidebarNumericFilterEntryToGraphql(
+        filter,
+        entry.rowText || '',
+        entry.name || '',
+        entry.value
+      );
+    }
+  }
+
+  function fetchFilteredBrowseResultsTotal(config) {
+    config = config || enhancer.config || {};
+    if (!hasNumericNexusBrowseFilters()) {
+      return Promise.resolve(0);
+    }
+    var sessionKey = getBrowseSessionKey();
+    if (enhancer.nexusFilteredGraphqlTotalSessionKey === sessionKey &&
+        enhancer.nexusFilteredGraphqlTotal > 0) {
+      lockNexusFilteredDisplayTotal(enhancer.nexusFilteredGraphqlTotal);
+      return Promise.resolve(enhancer.nexusFilteredGraphqlTotal);
+    }
+    if (enhancer.filteredBrowseTotalFetchInFlight) {
+      return Promise.resolve(getGraphqlFilteredBrowseResultsTotal());
+    }
+    enhancer.filteredBrowseTotalFetchInFlight = true;
+    var variables = buildFilteredBatchGraphqlVariables(0, 1, config);
+    return runModsListingGraphql(variables).then(function (result) {
+      enhancer.filteredBrowseTotalFetchInFlight = false;
+      if (result && result.totalCount > 0) {
+        var domTotals = scanNexusResultsTotalsFromDom();
+        var finalTotal = reconcileNumericFilteredResultsTotal(result.totalCount, domTotals);
+        if (finalTotal <= 0) {
+          return 0;
+        }
+        enhancer.nexusFilteredGraphqlTotal = finalTotal;
+        enhancer.nexusFilteredGraphqlTotalSessionKey = sessionKey;
+        mergeNexusFilteredResultsTotal(finalTotal);
+        lockNumericFilteredResultsTotal(finalTotal, domTotals);
+        logToHost('filtered browse graphql total', {
+          total: finalTotal,
+          graphqlTotal: result.totalCount,
+          domResults: domTotals.resultsTotal || 0,
+          domMatching: domTotals.matchingTotal || 0,
+          sessionKey: sessionKey,
+        });
+        publishNumericFilteredResultsTotal(finalTotal);
+        return finalTotal;
+      }
+      return 0;
+    }).catch(function () {
+      enhancer.filteredBrowseTotalFetchInFlight = false;
+      return 0;
+    });
+  }
+
+  function scheduleFilteredBrowseTotalFetch(config) {
+    config = config || enhancer.config || null;
+    if (!hasNumericNexusBrowseFilters()) {
+      return;
+    }
+    if (getGraphqlFilteredBrowseResultsTotal() > 0) {
+      return;
+    }
+    if (enhancer.filteredBrowseTotalFetchTimer) {
+      clearTimeout(enhancer.filteredBrowseTotalFetchTimer);
+    }
+    enhancer.filteredBrowseTotalFetchTimer = setTimeout(function () {
+      enhancer.filteredBrowseTotalFetchTimer = null;
+      fetchFilteredBrowseResultsTotal(config);
+    }, 150);
+  }
+
+  function filterFreshGraphqlNodes(nodes, config, options) {
+    options = options || {};
+    var minFresh = typeof options.minFresh === 'number' ? options.minFresh : 8;
+    if (!nodes || !nodes.length) {
+      return [];
+    }
+    var liveIds = collectLiveModIdSet(config);
+    var fresh = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (node && node.modId != null && !liveIds[String(node.modId)]) {
+        fresh.push(node);
+      }
+    }
+    if (fresh.length >= minFresh) {
+      return fresh;
+    }
+    return options.allowFallback === false ? fresh : nodes;
+  }
+
+  function filterFreshTileElements(tiles, config, options) {
+    options = options || {};
+    var minFresh = typeof options.minFresh === 'number' ? options.minFresh : 8;
+    if (!tiles || !tiles.length) {
+      return [];
+    }
+    var liveIds = collectLiveModIdSet(config);
+    var fresh = [];
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      var modId = extractModIdFromTile(tile);
+      if (modId && !liveIds[String(modId)]) {
+        fresh.push(tile);
+      }
+    }
+    if (fresh.length >= minFresh) {
+      return fresh;
+    }
+    return options.allowFallback === false ? fresh : tiles;
+  }
+
+  function shouldUseFilteredBrowseLightScan(config) {
+    if (!config || !isFilteredBrowseSession(config)) {
+      return false;
+    }
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return false;
+    }
+    return true;
+  }
+
+  function scheduleNumericFilteredHeadlineSync() {
+    return;
+  }
+
+  function refreshClientSideNumericCatalogRefs(config) {
+    config = config || enhancer.config || { installed: {}, tracked: {} };
+    if (!config.installed) {
+      config.installed = {};
+    }
+    if (!config.tracked) {
+      config.tracked = {};
+    }
+    var catalog = enhancer.filteredCarouselCatalog || [];
+    if (!catalog.length) {
+      return catalog;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var byModId = {};
+    if (grid) {
+      grid.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').forEach(function (tile) {
+        var modId = extractModIdFromTile(tile);
+        if (modId) {
+          byModId[String(modId)] = tile;
+        }
+      });
+    }
+    var refreshed = [];
+    for (var i = 0; i < catalog.length; i++) {
+      var entry = catalog[i];
+      if (!entry) {
+        continue;
+      }
+      var modId = entry.modId;
+      var card = (modId && byModId[String(modId)]) ? byModId[String(modId)] : entry.card;
+      if (!card || !document.body.contains(card)) {
+        continue;
+      }
+      refreshed.push({
+        card: card,
+        modId: modId,
+        installed: modId ? (config.installed[String(modId)] || null) : null,
+        tracked: !!(modId && config.tracked && config.tracked[String(modId)]),
+      });
+    }
+    if (refreshed.length) {
+      enhancer.filteredCarouselCatalog = refreshed;
+      enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+    }
+    return refreshed.length ? refreshed : catalog;
+  }
+
+  function getMinimalNumericBrowseCatalog(config) {
+    if (enhancer.clientSideNumericFilterActive) {
+      return refreshClientSideNumericCatalogRefs(config);
+    }
+    return collectMinimalNumericBrowseTiles(config);
+  }
+
+  function collectMinimalNumericBrowseTiles(config) {
+    config = config || enhancer.config || { installed: {}, tracked: {} };
+    if (!config.installed) {
+      config.installed = {};
+    }
+    if (!config.tracked) {
+      config.tracked = {};
+    }
+    if (enhancer.clientSideNumericFilterActive) {
+      return refreshClientSideNumericCatalogRefs(config);
+    }
+    var tiles = document.querySelectorAll(
+      'main [data-e2eid="mod-tile"]:not([data-vortex-pool-tile]), ' +
+      '#mainContent [data-e2eid="mod-tile"]:not([data-vortex-pool-tile])'
+    );
+    var catalog = [];
+    var seen = {};
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (tile.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+        continue;
+      }
+      var modId = extractModIdFromTile(tile);
+      var dedupeKey = modId ? String(modId) : ('tile-' + i);
+      if (seen[dedupeKey]) {
+        continue;
+      }
+      seen[dedupeKey] = true;
+      catalog.push({
+        card: tile,
+        modId: modId,
+        installed: modId ? (config.installed[String(modId)] || null) : null,
+        tracked: !!(modId && config.tracked && config.tracked[String(modId)]),
+      });
+    }
+    enhancer.filteredCarouselCatalog = catalog;
+    enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+    return catalog;
+  }
+
+  function ensureMinimalCarouselControlsQuick(config) {
+    var controls = ensureCarouselControls();
+    if (!controlsAreVisible(controls)) {
+      if (enhancer.controlsPinnedSortRow && document.body.contains(enhancer.controlsPinnedSortRow)) {
+        try {
+          mountCarouselControlsInSortRow(enhancer.controlsPinnedSortRow);
+        } catch (errPinnedQuick) {
+          mountControlsFallback(controls);
+        }
+      } else {
+        mountControlsFallback(controls);
+      }
+    }
+    return controls;
+  }
+
+  function ensureMinimalNumericCarouselLayout(config, options) {
+    options = options || {};
+    var grid = enhancer.nexusModGridRef;
+    if (!grid || !document.body.contains(grid)) {
+      var catalog = enhancer.filteredCarouselCatalog || [];
+      if (catalog.length && catalog[0].card && catalog[0].card.parentElement) {
+        grid = catalog[0].card.parentElement;
+      }
+    }
+    if (!grid) {
+      grid = document.querySelector('.vortex-enhanced-nexus-grid, .mods-grid');
+    }
+    if (!grid) {
+      return false;
+    }
+    document.documentElement.classList.add('vortex-enhanced-browse-wide', 'vortex-enhanced-filtered-browse');
+    grid.classList.add('vortex-enhanced-nexus-grid', 'vortex-enhanced-grid-layout');
+    applyGridLayoutStyles(grid, config);
+    enhancer.nexusModGridRef = grid;
+    var host = grid.parentElement;
+    if (host && !host.classList.contains('vortex-enhanced-carousel-host')) {
+      host.classList.add('vortex-enhanced-carousel-host');
+    }
+    if (options.mountControls !== false) {
+      try {
+        ensureMinimalCarouselControlsQuick(config);
+      } catch (errMinimalControls) {
+        // ignore
+      }
+    }
+    installCarouselWheelHandler();
+    return true;
+  }
+
+  function updateMinimalCarouselControlsInline(config, catalog, displayTotal) {
+    config = config || enhancer.config || {};
+    catalog = catalog || enhancer.filteredCarouselCatalog || [];
+    var controls = ensureMinimalCarouselControlsQuick(config);
+    if (!controls) {
+      return;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var currentPage = Math.max(0, enhancer.globalPageIndex || 0);
+    var loaded = catalog.length;
+    var lockedTotal = getLockedNexusFilteredDisplayTotal();
+    var hasLockedTotal = lockedTotal > 0 || displayTotal > 0;
+    var total = displayTotal > 0
+      ? displayTotal
+      : (lockedTotal > 0 ? lockedTotal : loaded);
+    var catalogPages = hasLockedTotal
+      ? Math.max(1, Math.ceil(total / pageSize))
+      : Math.max(1, Math.ceil(loaded / pageSize));
+    var pageDisplay = controls.querySelector('[data-carousel-page]');
+    var countDisplay = controls.querySelector('[data-carousel-count]');
+    if (pageDisplay) {
+      if (hasLockedTotal) {
+        pageDisplay.textContent = 'Page ' + (currentPage + 1) + ' of ' + catalogPages;
+      } else {
+        pageDisplay.textContent = 'Page ' + (currentPage + 1);
+      }
+    }
+    if (countDisplay) {
+      var start = loaded > 0 ? (currentPage * pageSize + 1) : 0;
+      var end = loaded > 0 ? Math.min(start + pageSize - 1, loaded) : 0;
+      countDisplay.textContent = loaded > 0
+        ? (hasLockedTotal
+          ? ('Showing ' + start + '\u2013' + end + ' of ' + total + ' results \u00b7 ' + pageSize + ' per page')
+          : ('Showing ' + start + '\u2013' + end + ' \u00b7 ' + pageSize + ' per page'))
+        : ('Loading filtered results \u00b7 ' + pageSize + ' per page');
+    }
+    var prevBtn = controls.querySelector('[data-carousel="-1"]');
+    var nextBtn = controls.querySelector('[data-carousel="1"]');
+    if (prevBtn) {
+      prevBtn.disabled = currentPage <= 0;
+    }
+    if (nextBtn) {
+      var nextStart = (currentPage + 1) * pageSize;
+      var hasLocalNext = nextStart < loaded;
+      var hasMorePages = (currentPage + 1) < catalogPages;
+      nextBtn.disabled = !hasLocalNext && !hasMorePages;
+      if (!hasLocalNext && loaded >= pageSize) {
+        nextBtn.disabled = false;
+      }
+    }
+  }
+
+  function applyMinimalNumericFilteredPage(config, catalog, options) {
+    options = options || {};
+    catalog = catalog || getMinimalNumericBrowseCatalog(config);
+    if (!catalog.length) {
+      updateMinimalCarouselControlsInline(config, catalog, 0);
+      return 0;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var currentPage = Math.max(0, enhancer.globalPageIndex || 0);
+    var sliceKey = String(currentPage) + ':' + catalog.length + ':' + pageSize;
+    if (!options.forcePageApply && enhancer.lastMinimalAppliedSliceKey === sliceKey) {
+      var lockedOnly = getLockedNexusFilteredDisplayTotal();
+      updateMinimalCarouselControlsInline(config, catalog, lockedOnly > 0 ? lockedOnly : catalog.length);
+      return Math.min(pageSize, Math.max(0, catalog.length - currentPage * pageSize));
+    }
+    var start = currentPage * pageSize;
+    var pageSlice = catalog.slice(start, start + pageSize);
+    var showIds = {};
+    for (var s = 0; s < pageSlice.length; s++) {
+      if (pageSlice[s].modId) {
+        showIds[String(pageSlice[s].modId)] = true;
+      }
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var matchedVisible = 0;
+    var tiles = [];
+    if (grid) {
+      tiles = queryLiveGridModTiles(grid, { minDirect: 0 });
+    }
+    if (hasNumericNexusBrowseFilters() && enhancer.tilePool && enhancer.tilePool.length) {
+      for (var poolTileIndex = 0; poolTileIndex < enhancer.tilePool.length; poolTileIndex++) {
+        var poolEntry = enhancer.tilePool[poolTileIndex];
+        var poolCard = poolEntry && poolEntry.card ? poolEntry.card : poolEntry;
+        if (poolCard && poolCard.nodeType && tiles.indexOf(poolCard) < 0) {
+          tiles.push(poolCard);
+        }
+      }
+    }
+    if (tiles.length < pageSlice.length) {
+      tiles = Array.prototype.slice.call(document.querySelectorAll(
+        'main [data-e2eid="mod-tile"], ' +
+        '#mainContent [data-e2eid="mod-tile"], ' +
+        '#vortex-enhanced-live-stash [data-e2eid="mod-tile"]'
+      ));
+    }
+    tiles.forEach(function (tile) {
+      if (tile.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
+        return;
+      }
+      var tileModId = extractModIdFromTile(tile);
+      var showTile = !!(tileModId && showIds[String(tileModId)]);
+      if (showTile) {
+        tile.classList.remove(
+          'vortex-enhanced-carousel-hidden',
+          'vortex-enhanced-nexus-live-hidden',
+          'vortex-enhanced-hidden'
+        );
+        tile.style.removeProperty('display');
+        if (grid && tile.parentElement !== grid) {
+          grid.appendChild(tile);
+        }
+        matchedVisible++;
+        if (config && tileModId) {
+          try {
+            decorateCard(
+              tile,
+              tileModId,
+              config.installed[String(tileModId)] || null,
+              config
+            );
+          } catch (errDecorateMinimalTile) {
+            // Ignore one card's decoration failure.
+          }
+        }
+      } else {
+        tile.classList.add('vortex-enhanced-carousel-hidden');
+        tile.style.setProperty('display', 'none', 'important');
+      }
+    });
+    traceStep('minimal-apply-slice', {
+      page: currentPage + 1,
+      slice: pageSlice.length,
+      visible: matchedVisible,
+      catalog: catalog.length,
+    });
+    var displayTotal = getLockedNexusFilteredDisplayTotal();
+    updateMinimalCarouselControlsInline(config, catalog, displayTotal);
+    if (enhancer.clientSideNumericFilterActive &&
+        !enhancer.clientSideNumericFetchInFlight &&
+        currentPage >= 1 &&
+        catalog.length < (currentPage + 2) * pageSize) {
+      // Warm the next carousel page while the current page is visible.
+      setTimeout(function () {
+        if (!enhancer.clientSideNumericFilterActive ||
+            enhancer.clientSideNumericFetchInFlight) {
+          return;
+        }
+        fetchMoreClientSideNumericCarouselMods(config, currentPage + 1).then(function (ok) {
+          if (ok && window.__vortexBrowseEnhancer) {
+            window.__vortexBrowseEnhancer.scheduleScan(true);
+          }
+        });
+      }, 0);
+    }
+    enhancer.lastMinimalAppliedSliceKey = sliceKey;
+    installCarouselWheelHandler();
+    return pageSlice.length;
+  }
+
+  function shouldUseClientSideNumericFilterApply() {
+    stashSidebarNumericFilters();
+    if (enhancer.stashedSidebarNumericFilters && enhancer.stashedSidebarNumericFilters.length) {
+      return true;
+    }
+    if (hasSidebarDownloadsFilterApplied()) {
+      return true;
+    }
+    if (hasNonDefaultNexusFilterChip()) {
+      return /download|endorse|file size|filesize/i.test(
+        document.body && document.body.textContent || ''
+      );
+    }
+    return hasVisibleNexusFilterChipText() &&
+      /max downloads|min downloads|max endorsements|min endorsements/i.test(
+        document.body && document.body.textContent || ''
+      );
+  }
+
+  function maybeScheduleClientSideNumericFilterApply(config) {
+    config = config || enhancer.config;
+    if (!config || !shouldAttemptClientSideNumericFilter()) {
+      return false;
+    }
+    if (enhancer.clientSideNumericFilterRetryTimer) {
+      clearTimeout(enhancer.clientSideNumericFilterRetryTimer);
+    }
+    enhancer.clientSideNumericFilterRetryTimer = setTimeout(function () {
+      enhancer.clientSideNumericFilterRetryTimer = null;
+      if (enhancer.clientSideNumericFilterActive || enhancer.clientSideNumericFilterApplyInFlight) {
+        return;
+      }
+      traceStep('client-side-numeric-filter-scheduled', {
+        stashed: (enhancer.stashedSidebarNumericFilters || []).length,
+      });
+      applySidebarNumericFiltersViaGraphql(config);
+    }, 150);
+    return false;
+  }
+
+  function captureSidebarNumericFilters() {
+    var captured = [];
+    var panel = document.getElementById('filters-panel') || findNexusFilterAside();
+    if (!panel) {
+      return captured;
+    }
+    var inputs = panel.querySelectorAll('input');
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (!input || input.type === 'checkbox' || input.type === 'radio' || input.type === 'hidden') {
+        continue;
+      }
+      var raw = normalizeUiText(input.value || '').replace(/,/g, '');
+      if (!raw) {
+        continue;
+      }
+      var parsed = parseInt(raw, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        continue;
+      }
+      var row = input.closest('section, fieldset, label, div');
+      var rowText = normalizeUiText(row && row.textContent || '').slice(0, 160);
+      var name = normalizeUiText(
+        input.getAttribute('name') ||
+        input.getAttribute('aria-label') ||
+        input.getAttribute('placeholder') ||
+        ''
+      );
+      captured.push({
+        rowText: rowText,
+        name: name,
+        value: parsed,
+      });
+    }
+    return captured;
+  }
+
+  function captureNumericFiltersFromDomChips() {
+    var captured = [];
+    var seen = {};
+    function pushEntry(rowText, name, value) {
+      if (!Number.isFinite(value) || value <= 0) {
+        return;
+      }
+      var key = String(name) + ':' + String(value);
+      if (seen[key]) {
+        return;
+      }
+      seen[key] = true;
+      captured.push({
+        rowText: rowText,
+        name: name,
+        value: value,
+      });
+    }
+    forEachActiveNexusFilterChip(function (chip) {
+      var text = normalizeUiText(chip.textContent || '');
+      var aria = normalizeUiText(chip.getAttribute && chip.getAttribute('aria-label') || '');
+      [text, aria].forEach(function (label) {
+        if (!label) {
+          return;
+        }
+        var maxDl = label.match(/max(?:imum)?\s+downloads?\s*[:]\s*([\d][\d,]*)/i);
+        if (maxDl) {
+          pushEntry(label.slice(0, 160), 'max downloads', parseInt(maxDl[1].replace(/,/g, ''), 10));
+        }
+        var minDl = label.match(/min(?:imum)?\s+downloads?\s*[:]\s*([\d][\d,]*)/i);
+        if (minDl) {
+          pushEntry(label.slice(0, 160), 'min downloads', parseInt(minDl[1].replace(/,/g, ''), 10));
+        }
+      });
+    });
+    var rows = document.querySelectorAll(
+      '[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]'
+    );
+    for (var i = 0; i < rows.length; i++) {
+      var rowText = normalizeUiText(rows[i].textContent || '');
+      var maxRow = rowText.match(/max downloads:\s*([\d,]+)/i);
+      if (maxRow) {
+        pushEntry(rowText.slice(0, 160), 'max downloads', parseInt(maxRow[1].replace(/,/g, ''), 10));
+      }
+      var minRow = rowText.match(/min downloads:\s*([\d,]+)/i);
+      if (minRow) {
+        pushEntry(rowText.slice(0, 160), 'min downloads', parseInt(minRow[1].replace(/,/g, ''), 10));
+      }
+    }
+    return captured;
+  }
+
+  function stashSidebarNumericFilters() {
+    var captured = captureSidebarNumericFilters();
+    if (!captured.length) {
+      captured = captureNumericFiltersFromDomChips();
+    }
+    if (captured.length) {
+      enhancer.stashedSidebarNumericFilters = captured;
+    }
+    return captured;
+  }
+
+  function getClientSideNumericFilterAttemptKey() {
+    var stashed = enhancer.stashedSidebarNumericFilters || [];
+    var chipKey = hasVisibleNexusFilterChipText() ? 'chip' : '';
+    return getBrowseSessionKey() + '|' + chipKey + '|' + stashed.map(function (entry) {
+      return String(entry.name || '') + ':' + String(entry.value || '');
+    }).join(';');
+  }
+
+  function markClientSideNumericFilterSkipped(reason) {
+    enhancer.clientSideNumericFilterSkipKey = getClientSideNumericFilterAttemptKey();
+    traceStep('client-side-numeric-filter-skipped', {
+      reason: reason || '',
+      key: enhancer.clientSideNumericFilterSkipKey,
+    });
+  }
+
+  function shouldAttemptClientSideNumericFilter() {
+    if (enhancer.clientSideNumericFilterActive || enhancer.clientSideNumericFilterApplyInFlight) {
+      return false;
+    }
+    if (enhancer.clientSideNumericFilterSkipKey &&
+        enhancer.clientSideNumericFilterSkipKey === getClientSideNumericFilterAttemptKey()) {
+      return false;
+    }
+    return shouldUseClientSideNumericFilterApply();
+  }
+
+  function applySidebarNumericFiltersViaGraphql(config) {
+    config = config || enhancer.config;
+    if (!config || !shouldAttemptClientSideNumericFilter()) {
+      return Promise.resolve(false);
+    }
+    if (enhancer.clientSideNumericFilterApplyInFlight) {
+      return Promise.resolve(false);
+    }
+    enhancer.clientSideNumericFilterApplyInFlight = true;
+    traceStep('client-side-numeric-filter-start', {
+      stashed: (enhancer.stashedSidebarNumericFilters || []).length,
+    });
+    return fetchFilteredBrowseResultsTotal(config).then(function () {
+      var variables = buildFilteredBatchGraphqlVariables(0, 80, config);
+      traceStep('client-side-numeric-filter-query', {
+        offset: variables.offset || 0,
+        count: variables.count || 0,
+        hasFilter: !!(variables.filter && Object.keys(variables.filter).length),
+      });
+      return runModsListingGraphql(variables);
+    }).then(function (result) {
+      if (!result || !result.nodes || !result.nodes.length) {
+        traceStep('client-side-numeric-filter-empty', {
+          total: result && result.totalCount ? result.totalCount : 0,
+        });
+        markClientSideNumericFilterSkipped('empty-result');
+        var nativeCatalog = collectMinimalNumericBrowseTiles(config);
+        if (nativeCatalog.length) {
+          // Keep the native first page visible, but allow later batches to
+          // use the client-side listing API instead of navigating Nexus.
+          enhancer.clientSideNumericFilterActive = true;
+          enhancer.filteredCarouselCatalog = nativeCatalog;
+          enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+          enhancer.filteredBrowseEngaged = true;
+          enhancer.domFilterBrowseActive = true;
+          syncFilteredBrowseDocumentState();
+          ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+          applyMinimalNumericFilteredPage(config, nativeCatalog, { forcePageApply: true });
+        }
+        return false;
+      }
+      enhancer.nexusFilterApplyInFlight = true;
+      enhancer.filteredBrowseEngaged = true;
+      enhancer.domFilterBrowseActive = true;
+      syncFilteredBrowseDocumentState();
+      enhancer.globalPageIndex = 0;
+      enhancer.batchPageIndex = 0;
+      enhancer.lastAppliedSliceKey = '';
+      enhancer.lastMinimalAppliedSliceKey = '';
+      enhancer.carouselPagingQuietUntil = Date.now() + 3000;
+      resetFilteredBrowseTotalsState();
+      var grid = resolveNexusModGridElement() || findModGrid();
+      if (!grid) {
+        return false;
+      }
+      var poolHost = document.getElementById('vortex-enhanced-pool-host');
+      var stash = ensureLiveStashHost();
+      grid.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').forEach(function (tile) {
+        setCarouselTileVisibility(tile, false, grid, poolHost, stash);
+      });
+      var catalog = [];
+      var nodes = filterFreshGraphqlNodes(result.nodes, config, { minFresh: 1, allowFallback: true });
+      for (var n = 0; n < nodes.length; n++) {
+        var tile = buildGraphQLModTile(nodes[n]);
+        tile.removeAttribute('data-vortex-pool-tile');
+        tile.removeAttribute(MARK);
+        grid.appendChild(tile);
+        var modId = extractModIdFromTile(tile);
+        catalog.push({
+          card: tile,
+          modId: modId,
+          installed: modId ? (config.installed[String(modId)] || null) : null,
+          tracked: !!(modId && config.tracked && config.tracked[String(modId)]),
+        });
+      }
+      enhancer.filteredCarouselCatalog = catalog;
+      enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+      if (typeof result.totalCount === 'number' && result.totalCount > 0) {
+        enhancer.nexusFilteredGraphqlTotal = result.totalCount;
+        enhancer.nexusFilteredGraphqlTotalSessionKey = getBrowseSessionKey();
+        lockNexusFilteredDisplayTotal(result.totalCount);
+      }
+      ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+      applyMinimalNumericFilteredPage(config, catalog, { forcePageApply: true });
+      for (var dc = 0; dc < catalog.length; dc++) {
+        try {
+          decorateCard(catalog[dc].card, catalog[dc].modId, catalog[dc].installed, config);
+        } catch (errDecorateClientTile) {
+          // ignore single tile decorate failures
+        }
+      }
+      try {
+        decorateVisibleGridTiles(config, { forceAll: true });
+      } catch (errDecorateClientGrid) {
+        // ignore
+      }
+      enhancer.clientSideNumericFilterActive = true;
+      enhancer.globalPageIndex = 0;
+      enhancer.batchPageIndex = 0;
+      installCarouselWheelHandler();
+      syncAutoAdvance();
+      try {
+        ensureCarouselControlsBar();
+        protectBrowseControlsFromChromeHide();
+      } catch (errClientControls) {
+        // ignore
+      }
+      traceStep('client-side-numeric-filter-done', {
+        tiles: catalog.length,
+        total: result.totalCount || 0,
+      });
+      logToHost('client-side numeric filter apply ok', {
+        tiles: catalog.length,
+        total: result.totalCount || 0,
+      });
+      return true;
+    }).catch(function (errClientFilter) {
+      markClientSideNumericFilterSkipped('error');
+      logErrorToHost('client-side numeric filter apply failed', {
+        error: String(errClientFilter && errClientFilter.message || errClientFilter),
+      });
+      var fallbackCatalog = collectMinimalNumericBrowseTiles(config);
+      if (fallbackCatalog.length) {
+        enhancer.clientSideNumericFilterActive = true;
+        enhancer.filteredCarouselCatalog = fallbackCatalog;
+        enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+        ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+        applyMinimalNumericFilteredPage(config, fallbackCatalog, { forcePageApply: true });
+      }
+      return false;
+    }).finally(function () {
+      enhancer.clientSideNumericFilterApplyInFlight = false;
+      enhancer.nexusFilterApplyInFlight = false;
+      enhancer.nexusFilterApplyStartUrl = '';
+      enhancer.pendingNexusFilterUrl = '';
+    });
+  }
+
+  function fetchMoreClientSideNumericCarouselMods(config, targetPage) {
+    config = config || enhancer.config;
+    if (!config || !enhancer.clientSideNumericFilterActive) {
+      return Promise.resolve(false);
+    }
+    if (enhancer.clientSideNumericFetchInFlight) {
+      return Promise.resolve(false);
+    }
+    var pageSize = getCarouselPageSize(config);
+    var catalog = refreshClientSideNumericCatalogRefs(config);
+    var needCount = (targetPage + 1) * pageSize;
+    if (catalog.length >= needCount) {
+      return Promise.resolve(true);
+    }
+    enhancer.clientSideNumericFetchInFlight = true;
+    var offset = catalog.length;
+    traceStep('client-side-numeric-fetch-more', {
+      offset: offset,
+      targetPage: targetPage + 1,
+      catalog: catalog.length,
+    });
+    var pageStateVariables = extractNexusPageModsListingVariables();
+    var variables = pageStateVariables || buildFilteredBatchGraphqlVariables(offset, 80, config);
+    if (hasNumericNexusBrowseFilters()) {
+      variables = cloneJson(variables);
+      ['downloads', 'endorsements', 'fileSize'].forEach(function (numericField) {
+        if (variables.filter) {
+          delete variables.filter[numericField];
+        }
+        if (variables.postFilter) {
+          delete variables.postFilter[numericField];
+        }
+      });
+    }
+    variables.offset = offset;
+    variables.count = 80;
+    return runModsListingGraphql(variables).then(function (result) {
+      if (!result || !result.nodes || !result.nodes.length) {
+        traceStep('client-side-numeric-fetch-more-graphql-empty', { offset: offset });
+        return runModsListingGraphql(variables).then(function (pageStateResult) {
+          if (!pageStateResult || !pageStateResult.nodes || !pageStateResult.nodes.length) {
+            var nativePage = Math.floor(offset / 80) + 2;
+            if (enhancer.fetchedNexusPages) {
+              delete enhancer.fetchedNexusPages[nativePage];
+            }
+            if (enhancer.nativeMergedPages) {
+              delete enhancer.nativeMergedPages[nativePage];
+            }
+            return fetchNativeNexusResultsPage(nativePage, config, {
+              allowNavigation: false,
+              ignoreNumericFilters: true,
+            }).then(function (nativeOk) {
+              if (!nativeOk) {
+                traceStep('client-side-numeric-fetch-more-empty', { offset: offset });
+                return false;
+              }
+              var refreshedNativeCatalog = collectMinimalNumericBrowseTiles(config);
+              return refreshedNativeCatalog.length > offset;
+            });
+          }
+          return pageStateResult;
+        });
+      }
+      return result;
+    }).then(function (result) {
+      if (!result || !result.nodes || !result.nodes.length) {
+        return false;
+      }
+      var grid = resolveNexusModGridElement() || findModGrid();
+      if (!grid) {
+        return false;
+      }
+      var nodes = filterFreshGraphqlNodes(result.nodes, config, { minFresh: 1, allowFallback: true });
+      var existingIds = {};
+      for (var c = 0; c < catalog.length; c++) {
+        if (catalog[c].modId) {
+          existingIds[String(catalog[c].modId)] = true;
+        }
+      }
+      for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        var nodeModId = node && (node.modId || node.id);
+        if (nodeModId && existingIds[String(nodeModId)]) {
+          continue;
+        }
+        var tile = buildGraphQLModTile(node);
+        tile.removeAttribute('data-vortex-pool-tile');
+        tile.removeAttribute(MARK);
+        grid.appendChild(tile);
+        var extractedId = extractModIdFromTile(tile);
+        catalog.push({
+          card: tile,
+          modId: extractedId,
+          installed: extractedId ? (config.installed[String(extractedId)] || null) : null,
+          tracked: !!(extractedId && config.tracked && config.tracked[String(extractedId)]),
+        });
+        if (extractedId) {
+          existingIds[String(extractedId)] = true;
+        }
+      }
+      enhancer.filteredCarouselCatalog = catalog;
+      enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+      if (typeof result.totalCount === 'number' && result.totalCount > 0) {
+        enhancer.nexusFilteredGraphqlTotal = result.totalCount;
+        enhancer.nexusFilteredGraphqlTotalSessionKey = getBrowseSessionKey();
+        lockNexusFilteredDisplayTotal(result.totalCount);
+      }
+      traceStep('client-side-numeric-fetch-more-done', {
+        added: nodes.length,
+        catalog: catalog.length,
+        total: result.totalCount || 0,
+      });
+      return catalog.length > offset;
+    }).catch(function (errClientFetchMore) {
+      logErrorToHost('client-side numeric fetch more failed', {
+        error: String(errClientFetchMore && errClientFetchMore.message || errClientFetchMore),
+        offset: offset,
+      });
+      return false;
+    }).finally(function () {
+      enhancer.clientSideNumericFetchInFlight = false;
+    });
+  }
+
+  function recoverBrowseOopsViaClientSideNumeric() {
+    var config = enhancer.config;
+    if (!config || !shouldUseClientSideNumericFilterApply()) {
+      return false;
+    }
+    var now = Date.now();
+    if (enhancer.oopsRecoveryInFlight && enhancer.oopsRecoveryStartedAt &&
+        now - enhancer.oopsRecoveryStartedAt < 3000) {
+      return true;
+    }
+    var attempts = enhancer.oopsRecoveryAttempts || 0;
+    if (attempts >= 6) {
+      return true;
+    }
+    enhancer.oopsRecoveryInFlight = true;
+    enhancer.oopsRecoveryStartedAt = now;
+    enhancer.oopsRecoveryAttempts = attempts + 1;
+    logToHost('browse oops client-side numeric recovery', {
+      attempts: attempts + 1,
+      stashed: (enhancer.stashedSidebarNumericFilters || []).length,
+    });
+    clearEnhancerLocks();
+    enhancer.enhancementFullyPaused = false;
+    enhancer.nexusFilterApplyInFlight = false;
+
+    function runClientApply() {
+      applySidebarNumericFiltersViaGraphql(config).finally(function () {
+        enhancer.oopsRecoveryInFlight = false;
+        if (window.__vortexBrowseEnhancer) {
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        }
+      });
+    }
+
+    if (isBrowseOopsPage()) {
+      var baseUrl = stripInternalBrowseParams(
+        enhancer.lastGoodBrowseUrl || window.location.href
+      );
+      try {
+        window.location.replace(baseUrl);
+      } catch (errOopsBase) {
+        try {
+          window.location.href = baseUrl;
+        } catch (errOopsHref) {
+          runClientApply();
+          return true;
+        }
+      }
+      setTimeout(runClientApply, 900);
+    } else {
+      runClientApply();
+    }
+    return true;
+  }
+
+  function executeMinimalNumericFilteredBrowseScan(config) {
+    config = config || enhancer.config;
+    if (!config) {
+      return emptyScanStats({});
+    }
+    if (!shouldUseNumericFilteredBrowseScan(config)) {
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    if (enhancer.minimalNumericScanInProgress) {
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    var stableSessionKey = getBrowseSessionKey();
+    if (enhancer.numericFilteredBrowseStableKey === stableSessionKey &&
+        (enhancer.filteredCarouselCatalog || []).length >= getCarouselPageSize(config)) {
+      ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+      applyMinimalNumericFilteredPage(config, enhancer.filteredCarouselCatalog);
+      updateMinimalCarouselControlsInline(
+        config,
+        enhancer.filteredCarouselCatalog,
+        getLockedNexusFilteredDisplayTotal()
+      );
+      traceStep('minimal-scan-stable', {
+        tiles: (enhancer.filteredCarouselCatalog || []).length,
+        page: (enhancer.globalPageIndex || 0) + 1,
+      });
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    if (enhancer.clientSideNumericFilterActive) {
+      var clientCatalog = refreshClientSideNumericCatalogRefs(config);
+      if (clientCatalog.length) {
+        ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+        applyMinimalNumericFilteredPage(config, clientCatalog);
+        try {
+          decorateVisibleGridTiles(config);
+        } catch (errClientSideDecorate) {
+          // ignore
+        }
+        var clientStats = {
+          tileCount: clientCatalog.length,
+          installedMatches: clientCatalog.filter(function (entry) { return !!entry.installed; }).length,
+          hideInstalled: !!config.hideInstalled,
+          onlyInstalled: !!config.onlyInstalled,
+          hideTracked: !!config.hideTracked,
+          onlyTracked: !!config.onlyTracked,
+          installedKeys: Object.keys(config.installed || {}).length,
+          numericFilteredScan: true,
+          minimalNumericScan: true,
+          clientSideNumeric: true,
+        };
+        enhancer.lastStats = clientStats;
+        traceStep('minimal-scan-client-side', {
+          tiles: clientCatalog.length,
+          page: (enhancer.globalPageIndex || 0) + 1,
+        });
+        return clientStats;
+      }
+    }
+    var pageSize = getCarouselPageSize(config);
+    var existingCatalogLen = (enhancer.filteredCarouselCatalog || []).length;
+    var now = Date.now();
+    if (enhancer.minimalNumericScanLastAt &&
+        now - enhancer.minimalNumericScanLastAt < 5000 &&
+        existingCatalogLen >= pageSize) {
+      traceStep('minimal-scan-coalesced', {
+        sinceMs: now - enhancer.minimalNumericScanLastAt,
+        catalog: existingCatalogLen,
+      });
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    if (enhancer.carouselPagingQuietUntil && now < enhancer.carouselPagingQuietUntil &&
+        existingCatalogLen >= pageSize) {
+      traceStep('minimal-scan-quiet', { catalog: existingCatalogLen });
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+    enhancer.minimalNumericScanInProgress = true;
+    enhancer.minimalNumericScanLastAt = now;
+    var catalog = [];
+    try {
+      traceStep('minimal-scan-start', { catalogBefore: existingCatalogLen });
+      if (hasNumericNexusBrowseFilters() ||
+          hasVisibleNexusFilterChipText() ||
+          (config.filterBrowseActive && urlHasActiveNexusFilters())) {
+        enhancer.filteredBrowseEngaged = true;
+        enhancer.domFilterBrowseActive = true;
+        if (hasNumericNexusBrowseFilters()) {
+          enhancer.hadNumericNexusBrowseFilters = true;
+        }
+        syncFilteredBrowseDocumentState();
+      }
+      traceStep('minimal-scan-state-synced', {});
+      if (!document.getElementById(STYLE_ID)) {
+        ensureStyles();
+      }
+      if (config.hideSiteChrome) {
+        document.documentElement.classList.add('vortex-enhanced-hide-chrome');
+      }
+      if (getNexusResultsPageFromUrl() > 1 || !enhancer.carouselAdvancePendingSince ||
+          Date.now() - enhancer.carouselAdvancePendingSince > 3000) {
+        enhancer.carouselAdvancePending = false;
+        enhancer.carouselAdvancePendingSince = 0;
+        enhancer.filteredNexusPageNavInFlight = false;
+        enhancer.filteredNexusPageNavSince = 0;
+      }
+      traceStep('minimal-scan-collect', {});
+      catalog = collectMinimalNumericBrowseTiles(config);
+      traceStep('minimal-scan-collected', { tiles: catalog.length });
+      if (hasNumericNexusBrowseFilters() && catalog.length &&
+          !enhancer.clientSideNumericFilterActive) {
+        // Native tiles are the reliable first batch. Keep them visible while
+        // enabling the listing API for subsequent batches.
+        enhancer.clientSideNumericFilterActive = true;
+        enhancer.filteredCarouselCatalog = catalog;
+        enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+      }
+      ensureMinimalNumericCarouselLayout(config, { mountControls: catalog.length > 0 });
+      if (catalog.length) {
+        traceStep('minimal-scan-apply-page', { tiles: catalog.length, page: (enhancer.globalPageIndex || 0) + 1 });
+        applyMinimalNumericFilteredPage(config, catalog);
+        if (catalog.length >= pageSize) {
+          enhancer.numericFilteredBrowseStableKey = getBrowseSessionKey();
+        }
+      } else {
+        updateMinimalCarouselControlsInline(config, catalog, 0);
+      }
+      setTimeout(function () {
+        if (!shouldUseNumericFilteredBrowseScan(config)) {
+          return;
+        }
+        scheduleFilteredBrowseTotalFetch(config);
+      }, 120);
+      traceStep('minimal-scan-done', { tiles: catalog.length });
+      if (catalog.length >= pageSize && !enhancer.numericControlsMountedOnce) {
+        enhancer.numericControlsMountedOnce = true;
+        setTimeout(function () {
+          try {
+            ensureCarouselControlsBar();
+            protectBrowseControlsFromChromeHide();
+          } catch (errDeferredSortMount) {
+            // ignore
+          }
+        }, 180);
+      }
+    } catch (errMinimalNumericScan) {
+      var errMsg = String(errMinimalNumericScan && errMinimalNumericScan.message || errMinimalNumericScan);
+      var errStack = errMinimalNumericScan && errMinimalNumericScan.stack
+        ? String(errMinimalNumericScan.stack).slice(0, 1200)
+        : '';
+      traceStep('minimal-scan-failed', {
+        step: enhancer.minimalNumericScanStep || '',
+        error: errMsg,
+      });
+      logErrorToHost('minimal numeric browse scan failed', {
+        error: errMsg,
+        step: enhancer.minimalNumericScanStep || '',
+        stack: errStack,
+      });
+      if ((enhancer.filteredCarouselCatalog || []).length >= pageSize) {
+        catalog = enhancer.filteredCarouselCatalog;
+      }
+    } finally {
+      installCarouselWheelHandler();
+      enhancer.minimalNumericScanInProgress = false;
+    }
+    if (!catalog.length) {
+      setTimeout(function () {
+        if (!shouldUseNumericFilteredBrowseScan(config)) {
+          return;
+        }
+        try {
+          if ((enhancer.filteredCarouselCatalog || []).length >= getCarouselPageSize(config)) {
+            return;
+          }
+          traceStep('minimal-scan-retry', {});
+          var retryCatalog = collectMinimalNumericBrowseTiles(config);
+          if (retryCatalog.length) {
+            ensureMinimalNumericCarouselLayout(config, { mountControls: true });
+            applyMinimalNumericFilteredPage(config, retryCatalog);
+            enhancer.numericFilteredBrowseStableKey = getBrowseSessionKey();
+            logToHost('minimal numeric scan retry ok', { tiles: retryCatalog.length });
+          }
+        } catch (errMinimalRetry) {
+          logErrorToHost('minimal numeric scan retry failed', {
+            error: String(errMinimalRetry && errMinimalRetry.message || errMinimalRetry),
+            step: enhancer.minimalNumericScanStep || '',
+          });
+        }
+      }, 450);
+    }
+    var stats = {
+      tileCount: catalog.length,
+      installedMatches: catalog.filter(function (entry) { return !!entry.installed; }).length,
+      hideInstalled: !!config.hideInstalled,
+      onlyInstalled: !!config.onlyInstalled,
+      hideTracked: !!config.hideTracked,
+      onlyTracked: !!config.onlyTracked,
+      installedKeys: Object.keys(config.installed || {}).length,
+      numericFilteredScan: true,
+      minimalNumericScan: true,
+    };
+    enhancer.lastStats = stats;
+    return stats;
+  }
+
+  function buildNumericFilteredLiveCatalog(config) {
+    config = config || enhancer.config || { installed: {}, tracked: {} };
+    if (!config.installed) {
+      config.installed = {};
+    }
+    if (!config.tracked) {
+      config.tracked = {};
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var catalog = [];
+    var seenModIds = {};
+    var tileNodes = [];
+    if (grid) {
+      tileNodes = queryLiveGridModTiles(grid, { minDirect: 1 });
+    }
+    var stash = document.getElementById('vortex-enhanced-live-stash');
+    if (stash) {
+      var stashed = stash.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])');
+      for (var s = 0; s < stashed.length; s++) {
+        if (tileNodes.indexOf(stashed[s]) < 0) {
+          tileNodes.push(stashed[s]);
+        }
+      }
+    }
+    var poolHost = document.getElementById('vortex-enhanced-pool-host');
+    if (poolHost) {
+      var pooled = poolHost.querySelectorAll('[data-e2eid="mod-tile"]');
+      for (var p = 0; p < pooled.length; p++) {
+        if (tileNodes.indexOf(pooled[p]) < 0) {
+          tileNodes.push(pooled[p]);
+        }
+      }
+    }
+    for (var i = 0; i < tileNodes.length; i++) {
+      var tile = tileNodes[i];
+      var modId = extractModIdFromTile(tile);
+      if (modId) {
+        seenModIds[String(modId)] = true;
+      }
+      catalog.push({
+        card: tile,
+        modId: modId,
+        installed: modId ? (config.installed[String(modId)] || null) : null,
+        tracked: !!(modId && config.tracked && config.tracked[String(modId)]),
+      });
+    }
+    if (hasNumericNexusBrowseFilters() && enhancer.tilePool && enhancer.tilePool.length) {
+      for (var p = 0; p < enhancer.tilePool.length; p++) {
+        var pooled = enhancer.tilePool[p];
+        var pooledCard = pooled && pooled.card ? pooled.card : pooled;
+        if (!pooledCard || !pooledCard.nodeType) {
+          continue;
+        }
+        var pooledModId = extractModIdFromTile(pooledCard);
+        var pooledKey = pooledModId ? String(pooledModId) : ('pool-' + p);
+        if (seen[pooledKey]) {
+          continue;
+        }
+        seen[pooledKey] = true;
+        catalog.push({
+          card: pooledCard,
+          modId: pooledModId,
+          installed: pooledModId ? (config.installed[String(pooledModId)] || null) : null,
+          tracked: !!(pooledModId && config.tracked && config.tracked[String(pooledModId)]),
+        });
+      }
+    }
+    var prior = enhancer.filteredCarouselCatalog || [];
+    for (var j = 0; j < prior.length; j++) {
+      var priorEntry = prior[j];
+      if (!priorEntry || !priorEntry.card) {
+        continue;
+      }
+      if (priorEntry.modId && seenModIds[String(priorEntry.modId)]) {
+        continue;
+      }
+      if (priorEntry.modId) {
+        seenModIds[String(priorEntry.modId)] = true;
+      }
+      catalog.push({
+        card: priorEntry.card,
+        modId: priorEntry.modId,
+        installed: priorEntry.installed || (priorEntry.modId
+          ? (config.installed[String(priorEntry.modId)] || null)
+          : null),
+        tracked: priorEntry.tracked != null
+          ? !!priorEntry.tracked
+          : !!(priorEntry.modId && config.tracked && config.tracked[String(priorEntry.modId)]),
+      });
+    }
+    enhancer.filteredCarouselCatalog = catalog;
+    enhancer.filteredCarouselCatalogSessionKey = getFilteredCarouselCatalogSessionKey(config);
+    return catalog;
+  }
+
+  function applyNumericFilteredLivePage(config, options) {
+    options = options || {};
+    config = config || enhancer.config;
+    if (!config) {
+      return 0;
+    }
+    if (options.forcePageApply || options.rebuildCatalog) {
+      buildNumericFilteredLiveCatalog(config);
+    }
+    var catalog = enhancer.filteredCarouselCatalog && enhancer.filteredCarouselCatalog.length
+      ? enhancer.filteredCarouselCatalog
+      : buildNumericFilteredLiveCatalog(config);
+    if (!catalog.length) {
+      return 0;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var currentPage = Math.max(0, enhancer.globalPageIndex || 0);
+    if (!options.forcePageApply &&
+        enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil) {
+      return 0;
+    }
+    var start = currentPage * pageSize;
+    var pageSlice = catalog.slice(start, start + pageSize);
+    if (!pageSlice.length && currentPage > 0) {
+      if (hasNumericNexusBrowseFilters()) {
+        return 0;
+      }
+      enhancer.globalPageIndex = 0;
+      enhancer.batchPageIndex = 0;
+      currentPage = 0;
+      start = 0;
+      pageSlice = catalog.slice(0, pageSize);
+      saveCarouselPagingState();
+    }
+    var showIds = {};
+    var showTileSet = typeof WeakSet === 'function' ? new WeakSet() : null;
+    var pageModIds = [];
+    for (var s = 0; s < pageSlice.length; s++) {
+      if (pageSlice[s].modId) {
+        showIds[String(pageSlice[s].modId)] = true;
+        pageModIds.push(pageSlice[s].modId);
+      }
+      if (pageSlice[s].card && showTileSet) {
+        showTileSet.add(pageSlice[s].card);
+      }
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var poolHost = document.getElementById('vortex-enhanced-pool-host');
+    var stash = document.getElementById('vortex-enhanced-live-stash');
+    function numericTileShouldShow(card, modId) {
+      if (showTileSet && showTileSet.has(card)) {
+        return true;
+      }
+      return !!(modId && showIds[String(modId)]);
+    }
+    for (var c = 0; c < catalog.length; c++) {
+      var entry = catalog[c];
+      if (!entry || !entry.card) {
+        continue;
+      }
+      setCarouselTileVisibility(
+        entry.card,
+        numericTileShouldShow(entry.card, entry.modId),
+        grid,
+        poolHost,
+        stash
+      );
+    }
+    if (grid) {
+      grid.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').forEach(function (tile) {
+        if (showTileSet && showTileSet.has(tile)) {
+          return;
+        }
+        var tileModId = extractModIdFromTile(tile);
+        setCarouselTileVisibility(tile, numericTileShouldShow(tile, tileModId), grid, poolHost, stash);
+      });
+    }
+    var decorated = 0;
+    try {
+      decorated = decorateFilteredPageTilesByModIds(config, showIds);
+    } catch (errNumericDecorate) {
+      logErrorToHost('numeric filtered page decorate failed', {
+        error: String(errNumericDecorate && errNumericDecorate.message || errNumericDecorate),
+      });
+    }
+    var displayTotal = getLockedNexusFilteredDisplayTotal() ||
+      resolveNumericFilteredResultsTotal() ||
+      catalog.length;
+    var batchPages = displayTotal > 0
+      ? Math.max(1, Math.ceil(displayTotal / pageSize))
+      : Math.max(1, Math.ceil(catalog.length / pageSize));
+    enhancer.lastAppliedSliceKey = getCarouselSliceKey(pageSize, pageModIds.sort(function (a, b) { return a - b; }));
+    updateCarouselControls(displayTotal, batchPages, pageSize, currentPage, {
+      skipCatalogResolve: true,
+      loadedCatalogCount: catalog.length,
+      displayTotal: displayTotal,
+      catalogPages: batchPages,
+    });
+    if (!options.skipControlsRemount) {
+      ensureNumericFilteredCarouselControls(config);
+    }
+    protectBrowseControlsFromChromeHide();
+    installCarouselWheelHandler();
+    return decorated;
+  }
+
+  function ensureNumericFilteredCarouselControls(config) {
+    var controls = ensureCarouselControls();
+    if (enhancer.controlsPinnedSortRow && document.body.contains(enhancer.controlsPinnedSortRow)) {
+      try {
+        mountCarouselControlsInSortRow(enhancer.controlsPinnedSortRow);
+      } catch (errPinnedSortRow) {
+        // ignore
+      }
+      return controls;
+    }
+    if (controls.parentElement &&
+        controls.parentElement !== document.body &&
+        document.body.contains(controls)) {
+      return controls;
+    }
+    try {
+      if (!mountControlsInCarouselHost(controls)) {
+        mountControlsFallback(controls);
+      }
+    } catch (errMountNumericControls) {
+      try {
+        mountControlsFallback(controls);
+      } catch (errMountNumericFallback) {
+        // ignore
+      }
+    }
+    return controls;
+  }
+
+  function ensureNumericFilteredCarouselLayout(config) {
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return false;
+    }
+    document.documentElement.classList.add('vortex-enhanced-browse-wide', 'vortex-enhanced-filtered-browse');
+    grid.classList.add('vortex-enhanced-nexus-grid');
+    applyGridLayoutStyles(grid, config);
+    enhancer.nexusModGridRef = grid;
+    var host = grid.parentElement;
+    if (host && !host.classList.contains('vortex-enhanced-carousel-host')) {
+      host.classList.add('vortex-enhanced-carousel-host');
+    }
+    ensureNumericFilteredCarouselControls(config);
+    installCarouselWheelHandler();
+    syncAutoAdvance();
+    return true;
+  }
+
+  function executeNumericFilteredBrowseScan(config) {
+    return executeMinimalNumericFilteredBrowseScan(config);
+  }
+
+  function scanFilteredBrowseLight(config) {
+    if (getNexusResultsPageFromUrl() > 1 || !enhancer.carouselAdvancePendingSince ||
+        Date.now() - enhancer.carouselAdvancePendingSince > 3000) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+    }
+    if (isNexusAuthPage()) {
+      clearAuthPageEnhancement();
+      return {
+        tileCount: 0,
+        installedMatches: 0,
+        hideInstalled: !!config.hideInstalled,
+        onlyInstalled: !!config.onlyInstalled,
+        hideTracked: !!config.hideTracked,
+        onlyTracked: !!config.onlyTracked,
+        installedKeys: Object.keys(config.installed || {}).length,
+        filteredBrowseLight: true,
+        authPage: true,
+      };
+    }
+    if (config && config.hideSiteChrome) {
+      document.documentElement.classList.add('vortex-enhanced-hide-chrome');
+    }
+    hideNexusItemsPerPageUi();
+    tagNexusPaginationNav();
+    protectBrowseControlsFromChromeHide();
+    refreshDomFilteredBrowseState();
+    syncFilteredBrowseDocumentState();
+    var liveCount = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+    ensureFilteredCarouselCatalogFromLive(config);
+    var needsApply = enhancer.carouselAdvancePending ||
+      !enhancer.lastAppliedSliceKey ||
+      !document.querySelector('.vortex-enhanced-carousel-controls') ||
+      gridVisibleTilesNeedDecoration(config);
+    if (needsApply) {
+      safeApplyFilteredBrowseLiveOnlyPage(config, {
+        forcePageApply: (enhancer.globalPageIndex || 0) > 0,
+        skipHeadlineSync: true,
+      });
+    } else {
+      decorateVisibleFilteredCarouselTiles(config);
+    }
+    ensureCarouselControlsBar();
+    pinNexusFilteredResultsTotal();
+    syncNexusFilteredResultsHeadlines();
+    return {
+      tileCount: liveCount,
+      installedMatches: 0,
+      hideInstalled: !!config.hideInstalled,
+      onlyInstalled: !!config.onlyInstalled,
+      hideTracked: !!config.hideTracked,
+      onlyTracked: !!config.onlyTracked,
+      installedKeys: Object.keys(config.installed || {}).length,
+      filteredBrowseLight: true,
+    };
+  }
+
+  function applyFilteredBrowseLightPage(config, options) {
+    options = options || {};
+    if (!config) {
+      return 0;
+    }
+    return safeApplyFilteredBrowseLiveOnlyPage(config, options);
+  }
+
+  function isBrowseOopsHtml(html) {
+    if (!html) {
+      return false;
+    }
+    return /oops!? something went wrong|something went wrong|unexpected error|page could not be loaded/i.test(html);
+  }
+
+  function parseModTilesFromHtml(html, baseUrl, config) {
+    if (isBrowseOopsHtml(html)) {
+      return [];
+    }
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var tiles = doc.querySelectorAll('[data-e2eid="mod-tile"]');
     var parsed = [];
@@ -2345,7 +7679,18 @@
       fixTileResourceUrls(clone, baseUrl);
       parsed.push(clone);
     }
-    return parsed;
+    if (parsed.length >= 8) {
+      return parsed;
+    }
+    var nodes = parseGraphqlModNodesFromNextHtml(html);
+    if (!nodes.length) {
+      return parsed;
+    }
+    var built = [];
+    for (var n = 0; n < nodes.length; n++) {
+      built.push(buildGraphQLModTile(nodes[n]));
+    }
+    return built;
   }
 
   function appendFetchedTilesToPool(tileElements, config) {
@@ -2399,7 +7744,7 @@
     var params = new URLSearchParams(window.location.search);
     var arr = function (key) { return params.getAll(key); };
     var one = function (key) { return params.get(key) || null; };
-    return {
+    var context = {
       gameName: getGameDomainFromPath(),
       categories: arr('categoryName'),
       tagsContains: arr('tag'),
@@ -2415,6 +7760,28 @@
       vortexSupport: params.get('supportsVortex'),
       onlyUpdated: params.get('hasUpdated'),
     };
+    // Numeric Apply is handled before Nexus updates the URL. Read adult state
+    // from the live sidebar so the same GraphQL request includes it.
+    var panel = findNexusFilterAside();
+    if (panel) {
+      var controls = panel.querySelectorAll(
+        'input[type="checkbox"], button[role="checkbox"], [role="checkbox"]'
+      );
+      for (var i = 0; i < controls.length; i++) {
+        if (controls[i].closest('[data-vortex-enhanced-filters="true"]')) {
+          continue;
+        }
+        var label = getNexusFilterInputLabel(controls[i]).toLowerCase();
+        if (label.indexOf('show only adult') >= 0) {
+          context.showAdult = isNexusFilterInputChecked(controls[i]) ? 'true' : null;
+          context.onlyAdult = null;
+        } else if (label.indexOf('hide adult') >= 0) {
+          context.onlyAdult = isNexusFilterInputChecked(controls[i]) ? 'false' : null;
+          context.showAdult = null;
+        }
+      }
+    }
+    return context;
   }
 
   function escHtml(value) {
@@ -2628,6 +7995,363 @@
     return root;
   }
 
+  function parseNumericUrlValue(raw) {
+    if (raw == null || raw === '') {
+      return null;
+    }
+    var cleaned = String(raw).replace(/,/g, '').trim();
+    var rangeMatch = cleaned.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      return {
+        min: parseInt(rangeMatch[1], 10),
+        max: parseInt(rangeMatch[2], 10),
+      };
+    }
+    var single = parseInt(cleaned, 10);
+    return isNaN(single) ? null : { single: single };
+  }
+
+  function pushGraphqlIntFilter(target, field, op, value) {
+    if (value == null || isNaN(value)) {
+      return;
+    }
+    target[field] = target[field] || [];
+    var normalized = String(value);
+    for (var i = 0; i < target[field].length; i++) {
+      var existing = target[field][i];
+      if (existing && existing.op === op && String(existing.value) === normalized) {
+        return;
+      }
+    }
+    target[field].push({ op: op, value: normalized });
+  }
+
+  function scheduleFilteredBrowseRescan(delayMs) {
+    delayMs = typeof delayMs === 'number' && delayMs >= 0 ? delayMs : 400;
+    if (enhancer.filteredBrowseRescanTimer) {
+      clearTimeout(enhancer.filteredBrowseRescanTimer);
+      enhancer.filteredBrowseRescanTimer = null;
+    }
+    enhancer.filteredBrowseRescanTimer = setTimeout(function () {
+      enhancer.filteredBrowseRescanTimer = null;
+      if (!window.__vortexBrowseEnhancer ||
+          !(urlHasActiveNexusFilters() || hasNumericNexusBrowseFilters() ||
+            isFilteredBrowseSession(enhancer.config || {}))) {
+        return;
+      }
+      if (gridVisibleTilesNeedDecoration(enhancer.config || {})) {
+        decorateVisibleFilteredCarouselTiles(enhancer.config || {});
+      }
+      if (window.__vortexBrowseEnhancer) {
+        window.__vortexBrowseEnhancer.scheduleScan(false);
+      }
+    }, delayMs);
+  }
+
+  function scheduleFilteredBrowseDecorationRetry(config) {
+    if (!config || !(urlHasActiveNexusFilters() || hasNumericNexusBrowseFilters() || isFilteredBrowseSession(config))) {
+      return;
+    }
+    if (enhancer.filteredBrowseDecorateRetryGen === undefined) {
+      enhancer.filteredBrowseDecorateRetryGen = 0;
+    }
+    var retryGen = ++enhancer.filteredBrowseDecorateRetryGen;
+    applyFiltersToAllGridTiles(config);
+    dedupeLiveGridModTiles(config);
+    decorateVisibleFilteredCarouselTiles(config);
+    [120, 400, 900].forEach(function (delayMs) {
+      setTimeout(function () {
+        if (!window.__vortexBrowseEnhancer || retryGen !== enhancer.filteredBrowseDecorateRetryGen) {
+          return;
+        }
+        if (!(urlHasActiveNexusFilters() || hasNumericNexusBrowseFilters() || isFilteredBrowseSession(config))) {
+          return;
+        }
+        if (gridVisibleTilesNeedDecoration(config)) {
+          applyFiltersToAllGridTiles(config);
+          dedupeLiveGridModTiles(config);
+          decorateVisibleFilteredCarouselTiles(config);
+          installCarouselWheelHandler();
+          ensureCarouselControlsBar();
+          protectBrowseControlsFromChromeHide();
+        }
+      }, delayMs);
+    });
+  }
+
+  function applyNumericFilterFromChipText(filter, text) {
+    if (!filter || !text) {
+      return;
+    }
+    var maxDownloads = text.match(/max(?:imum)?\s+downloads?\s*[:]\s*([\d][\d,]*)/i) ||
+      text.match(/downloads?\s*(?:≤|<=|under|up to|max)\s*([\d][\d,]*)/i);
+    if (maxDownloads) {
+      pushGraphqlIntFilter(
+        filter,
+        'downloads',
+        'LTE',
+        parseInt(maxDownloads[1].replace(/,/g, ''), 10)
+      );
+    }
+    var minDownloads = text.match(/min(?:imum)?\s+downloads?\s*[:]\s*([\d][\d,]*)/i) ||
+      text.match(/downloads?\s*(?:≥|>=|over|at least|min)\s*([\d][\d,]*)/i);
+    if (minDownloads) {
+      pushGraphqlIntFilter(
+        filter,
+        'downloads',
+        'GTE',
+        parseInt(minDownloads[1].replace(/,/g, ''), 10)
+      );
+    }
+    var maxEndorse = text.match(/max(?:imum)?\s+endorsements?\s*[:]\s*([\d][\d,]*)/i);
+    if (maxEndorse) {
+      pushGraphqlIntFilter(
+        filter,
+        'endorsements',
+        'LTE',
+        parseInt(maxEndorse[1].replace(/,/g, ''), 10)
+      );
+    }
+    var minEndorse = text.match(/min(?:imum)?\s+endorsements?\s*[:]\s*([\d][\d,]*)/i);
+    if (minEndorse) {
+      pushGraphqlIntFilter(
+        filter,
+        'endorsements',
+        'GTE',
+        parseInt(minEndorse[1].replace(/,/g, ''), 10)
+      );
+    }
+  }
+
+  function forEachActiveNexusFilterChip(callback) {
+    if (typeof callback !== 'function') {
+      return;
+    }
+    var seen = {};
+    var chipSelectors = [
+      '.vortex-enhanced-nexus-active-filters button',
+      '.vortex-enhanced-nexus-active-filters a',
+      '[class*="ActiveFilter"] button',
+      '[class*="ActiveFilter"] a',
+      '[class*="AppliedFilter"] button',
+      '[class*="AppliedFilter"] a',
+      '[class*="ResultsHeader"] button',
+      '[class*="ResultsHeader"] a',
+    ];
+    chipSelectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (chip) {
+        if (isClearAllControl(chip) || seen[chip]) {
+          return;
+        }
+        if (!isInMainBrowseColumn(chip, { ignoreVisibility: true })) {
+          return;
+        }
+        seen[chip] = true;
+        callback(chip);
+      });
+    });
+    document.querySelectorAll('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]').forEach(function (row) {
+      row.querySelectorAll('button, a, [role="button"]').forEach(function (chip) {
+        if (isClearAllControl(chip) || seen[chip]) {
+          return;
+        }
+        if (!isInMainBrowseColumn(chip, { ignoreVisibility: true })) {
+          return;
+        }
+        var text = normalizeUiText(chip.textContent || '');
+        if (text.length < 4 || text.length > 72) {
+          return;
+        }
+        if (!/max downloads|min downloads|max endorsements|min endorsements|^excluded:|^included:|^category:|^tag:/i.test(text)) {
+          return;
+        }
+        seen[chip] = true;
+        callback(chip);
+      });
+    });
+  }
+
+  function applyActiveFilterChipNumericFilters(filter) {
+    if (!filter) {
+      return;
+    }
+    forEachActiveNexusFilterChip(function (chip) {
+      var text = normalizeUiText(chip.textContent);
+      var aria = normalizeUiText(chip.getAttribute && chip.getAttribute('aria-label'));
+      applyNumericFilterFromChipText(filter, text);
+      if (aria && aria !== text) {
+        applyNumericFilterFromChipText(filter, aria);
+      }
+    });
+  }
+
+  function mergeGraphqlFilterJsonTarget(target, source) {
+    if (!target || !source || typeof source !== 'object') {
+      return;
+    }
+    Object.keys(source).forEach(function (key) {
+      var value = source[key];
+      if (key === 'filter' && Array.isArray(value)) {
+        value.forEach(function (entry) {
+          mergeGraphqlFilterJsonTarget(target, entry);
+        });
+        return;
+      }
+      if (Array.isArray(value)) {
+        target[key] = target[key] || [];
+        value.forEach(function (entry) {
+          if (!entry || typeof entry !== 'object') {
+            return;
+          }
+          if (entry.op != null && entry.value != null) {
+            pushGraphqlIntFilter(target, key, entry.op, entry.value);
+          }
+        });
+        return;
+      }
+      if (value && typeof value === 'object' && value.op != null && value.value != null) {
+        pushGraphqlIntFilter(target, key, value.op, value.value);
+      }
+    });
+  }
+
+  function applyUrlJsonFilterParams(filter) {
+    if (!filter) {
+      return;
+    }
+    try {
+      var params = new URLSearchParams(window.location.search);
+      ['filter', 'filters', 'nodeFilter', 'nodesFilter'].forEach(function (key) {
+        params.getAll(key).forEach(function (raw) {
+          if (!raw) {
+            return;
+          }
+          var decoded = raw;
+          try {
+            if (decoded.indexOf('%') >= 0) {
+              decoded = decodeURIComponent(decoded);
+            }
+            if (decoded.charAt(0) !== '{' && decoded.charAt(0) !== '[') {
+              return;
+            }
+            mergeGraphqlFilterJsonTarget(filter, JSON.parse(decoded));
+          } catch (errJsonFilter) {
+            // ignore malformed filter blobs
+          }
+        });
+      });
+    } catch (errUrlJsonFilters) {
+      // ignore
+    }
+  }
+
+  function resolveNumericFilterField(key) {
+    var k = String(key || '').toLowerCase().replace(/[_-]/g, '');
+    if (k.indexOf('download') >= 0) {
+      return 'downloads';
+    }
+    if (k.indexOf('endorse') >= 0) {
+      return 'endorsements';
+    }
+    if (k.indexOf('filesize') >= 0 || k === 'size') {
+      return 'fileSize';
+    }
+    return null;
+  }
+
+  function applyHashBrowseNumericFilters(filter) {
+    if (!filter) {
+      return;
+    }
+    try {
+      var hash = (window.location.hash || '').replace(/^#/, '').trim();
+      if (!hash) {
+        return;
+      }
+      hash.split(/[&;]/).forEach(function (segment) {
+        if (!segment) {
+          return;
+        }
+        var eq = segment.indexOf('=');
+        var key = eq >= 0 ? segment.slice(0, eq) : segment;
+        var value = eq >= 0 ? segment.slice(eq + 1) : '';
+        key = decodeURIComponent(key || '').trim();
+        value = decodeURIComponent(value || '').trim();
+        if (!key) {
+          return;
+        }
+        var field = resolveNumericFilterField(key);
+        if (!field) {
+          return;
+        }
+        var parsed = parseNumericUrlValue(value);
+        if (!parsed) {
+          return;
+        }
+        if (parsed.min != null) {
+          pushGraphqlIntFilter(filter, field, 'GTE', parsed.min);
+        }
+        if (parsed.max != null) {
+          pushGraphqlIntFilter(filter, field, 'LTE', parsed.max);
+        }
+        if (parsed.single != null) {
+          if (/max|to|upper|less|lte/i.test(key)) {
+            pushGraphqlIntFilter(filter, field, 'LTE', parsed.single);
+          } else if (/min|from|greater|gte/i.test(key)) {
+            pushGraphqlIntFilter(filter, field, 'GTE', parsed.single);
+          }
+        }
+      });
+    } catch (errHashFilters) {
+      // ignore
+    }
+  }
+
+  function applyNexusUrlNumericFilters(filter) {
+    if (!filter) {
+      return;
+    }
+    applyUrlJsonFilterParams(filter);
+    applyActiveFilterChipNumericFilters(filter);
+    applyHashBrowseNumericFilters(filter);
+    try {
+      var params = new URLSearchParams(window.location.search);
+      params.forEach(function (value, key) {
+        var k = key.toLowerCase().replace(/[_-]/g, '');
+        if (k === 'filter' || k === 'filters' || k === 'nodefilter' || k === 'nodesfilter') {
+          return;
+        }
+        var parsed = parseNumericUrlValue(value);
+        if (!parsed) {
+          return;
+        }
+
+        var field = resolveNumericFilterField(k);
+        if (!field) {
+          return;
+        }
+
+        if (parsed.min != null) {
+          pushGraphqlIntFilter(filter, field, 'GTE', parsed.min);
+        }
+        if (parsed.max != null) {
+          pushGraphqlIntFilter(filter, field, 'LTE', parsed.max);
+        }
+        if (parsed.single != null) {
+          if (k.indexOf('max') >= 0 || k.indexOf('to') >= 0 || k.indexOf('upper') >= 0 ||
+              k.indexOf('less') >= 0 || k.indexOf('lte') >= 0) {
+            pushGraphqlIntFilter(filter, field, 'LTE', parsed.single);
+          } else if (k.indexOf('min') >= 0 || k.indexOf('from') >= 0 || k.indexOf('greater') >= 0 ||
+                     k.indexOf('gte') >= 0) {
+            pushGraphqlIntFilter(filter, field, 'GTE', parsed.single);
+          }
+        }
+      });
+    } catch (errUrlFilters) {
+      // ignore
+    }
+  }
+
   function buildModsListingVariables(offset, count, ctx, config) {
     var adultFilter = [];
     if (ctx.onlyAdult === 'false') {
@@ -2637,7 +8361,7 @@
     }
 
     var tagsExclude = (ctx.tagsExclude || []).slice();
-    if ((enhancer.hideTranslationsApplied || enhancer.clientHideTranslations) &&
+    if (shouldFilterTranslationsClientSide() &&
         !tagsExclude.some(function (tag) { return /translation/i.test(String(tag)); })) {
       tagsExclude.push('Translation');
     }
@@ -2648,7 +8372,7 @@
         : [],
     };
 
-    if ((enhancer.hideTranslationsApplied || enhancer.clientHideTranslations)) {
+    if (shouldFilterTranslationsClientSide()) {
       postFilter.categoryName = [{ op: 'NOT_EQUALS', value: 'Translation' }];
     }
 
@@ -2661,7 +8385,6 @@
         tag: ctx.tagsContains || [],
       },
       filter: {
-        filter: [],
         adultContent: adultFilter,
         gameDomainName: ctx.gameName ? [{ op: 'EQUALS', value: ctx.gameName }] : [],
         hasUpdated: ctx.onlyUpdated ? [{ op: 'EQUALS', value: ctx.onlyUpdated === 'true' }] : [],
@@ -2709,12 +8432,12 @@
       variables.filter.description = [{ op: 'MATCHES', value: String(ctx.description) }];
     }
 
+    applyNexusUrlNumericFilters(variables.filter);
+
     return variables;
   }
 
-  function fetchModsListingBatch(offset, count, config) {
-    var ctx = loadNexusListingContext();
-    var variables = buildModsListingVariables(offset, count, ctx, config);
+  function runModsListingGraphql(variables) {
     var query = [
       'query ModsListing($count: Int = 0, $facets: ModsFacet, $filter: ModsFilter, $offset: Int, $postFilter: ModsFilter, $sort: [ModsSort!]) {',
       '  mods(count: $count, facets: $facets, filter: $filter, offset: $offset, postFilter: $postFilter, sort: $sort, viewUserBlockedContent: false) {',
@@ -2733,12 +8456,41 @@
         return null;
       }
       if (typeof data.totalCount === 'number' && data.totalCount > 0) {
-        enhancer.nexusCatalogTotal = data.totalCount;
+        if (isNexusFilteredBrowse()) {
+          if (!hasNumericNexusBrowseFilters()) {
+            mergeNexusFilteredResultsTotal(data.totalCount);
+            var filteredTotal = getLockedNexusFilteredDisplayTotal();
+            if (filteredTotal > 0) {
+              enhancer.nexusCatalogTotal = filteredTotal;
+            }
+          }
+        } else {
+          enhancer.nexusCatalogTotal = data.totalCount;
+        }
       }
       return { nodes: data.nodes, totalCount: data.totalCount || 0 };
     }).catch(function () {
       return null;
     });
+  }
+
+  function fetchModsListingBatch(offset, count, config) {
+    var ctx = loadNexusListingContext();
+    var variables = buildModsListingVariables(offset, count, ctx, config);
+    return runModsListingGraphql(variables);
+  }
+
+  function fetchModsListingBatchFromPageState(offset, count) {
+    if (isNexusFilteredBrowse()) {
+      return runModsListingGraphql(buildFilteredBatchGraphqlVariables(offset, count, enhancer.config || {}));
+    }
+    var pageVars = extractNexusPageModsListingVariables();
+    if (!pageVars) {
+      return Promise.resolve(null);
+    }
+    pageVars.offset = offset;
+    pageVars.count = count;
+    return runModsListingGraphql(pageVars);
   }
 
   function resolveBrowseSortField(ctx) {
@@ -2793,8 +8545,175 @@
     return 'vortex-enhanced-native-pool:' + getBrowseSessionKey();
   }
 
+  function getDismissedPoolStorageKey() {
+    return 'vortex-enhanced-dismissed-pool:' + getBrowseSessionKey();
+  }
+
+  function saveDismissedBrowsePoolSnapshot(config) {
+    if (!isDismissedCarouselBrowseMode(config)) {
+      return;
+    }
+    var cards = collectCards(config);
+    if (!cards || cards.length < 1) {
+      return;
+    }
+    var snapshot = {
+      sessionKey: getBrowseSessionKey(),
+      globalPageIndex: enhancer.globalPageIndex || 0,
+      catalogModOffset: enhancer.catalogModOffset || 0,
+      fetchedPages: enhancer.fetchedNexusPages || {},
+      entries: [],
+    };
+    for (var i = 0; i < cards.length; i++) {
+      var cardEntry = cards[i];
+      if (!cardEntry || !cardEntry.modId) {
+        continue;
+      }
+      snapshot.entries.push({
+        modId: cardEntry.modId,
+        catalogIndex: resolveCatalogIndex(cardEntry.card, cardEntry.modId),
+      });
+    }
+    if (!snapshot.entries.length) {
+      return;
+    }
+    try {
+      sessionStorage.setItem(getDismissedPoolStorageKey(), JSON.stringify(snapshot));
+    } catch (errSaveDismissedPool) {
+      // ignore quota / private mode
+    }
+  }
+
+  function restoreDismissedBrowsePoolSnapshot(config) {
+    var raw = null;
+    try {
+      raw = sessionStorage.getItem(getDismissedPoolStorageKey());
+    } catch (errReadDismissedPool) {
+      return Promise.resolve(false);
+    }
+    if (!raw) {
+      return Promise.resolve(false);
+    }
+
+    var snapshot = null;
+    try {
+      snapshot = JSON.parse(raw);
+    } catch (errParseDismissedPool) {
+      try {
+        sessionStorage.removeItem(getDismissedPoolStorageKey());
+      } catch (errRemoveDismissedPool) {
+        // ignore
+      }
+      return Promise.resolve(false);
+    }
+
+    if (!snapshot || snapshot.sessionKey !== getBrowseSessionKey() ||
+        !snapshot.entries || !snapshot.entries.length) {
+      try {
+        sessionStorage.removeItem(getDismissedPoolStorageKey());
+      } catch (errRemoveDismissedPool2) {
+        // ignore
+      }
+      return Promise.resolve(false);
+    }
+
+    if (typeof snapshot.catalogModOffset === 'number' && snapshot.catalogModOffset >= 0) {
+      enhancer.catalogModOffset = snapshot.catalogModOffset;
+    }
+    enhancer.fetchedNexusPages = snapshot.fetchedPages || {};
+
+    var modIds = [];
+    for (var i = 0; i < snapshot.entries.length; i++) {
+      if (snapshot.entries[i] && snapshot.entries[i].modId) {
+        modIds.push(snapshot.entries[i].modId);
+      }
+    }
+    if (!modIds.length) {
+      return Promise.resolve(false);
+    }
+
+    return fetchModsByUidForTiles(modIds, config).then(function (nodes) {
+      if (!nodes || !nodes.length) {
+        return false;
+      }
+      var byModId = {};
+      for (var n = 0; n < nodes.length; n++) {
+        if (nodes[n] && nodes[n].modId != null) {
+          byModId[String(nodes[n].modId)] = nodes[n];
+        }
+      }
+
+      var tiles = [];
+      for (var j = 0; j < snapshot.entries.length; j++) {
+        var entry = snapshot.entries[j];
+        var node = byModId[String(entry.modId)];
+        if (!node) {
+          continue;
+        }
+        var tile = buildGraphQLModTile(node);
+        if (typeof entry.catalogIndex === 'number') {
+          tile.setAttribute('data-vortex-catalog-index', String(entry.catalogIndex));
+          rememberCatalogIndex(entry.modId, entry.catalogIndex);
+        }
+        tiles.push(tile);
+      }
+
+      if (!tiles.length) {
+        return false;
+      }
+
+      var added = appendFetchedTilesToPool(tiles, config);
+      if (added > 0) {
+        try {
+          sessionStorage.removeItem(getDismissedPoolStorageKey());
+        } catch (errRemoveDismissedPool3) {
+          // ignore
+        }
+      }
+      return added > 0;
+    }).catch(function () {
+      return false;
+    });
+  }
+
+  function clampDismissedCarouselPageToLoadedCatalog(config) {
+    if (!isPooledNexusCarouselBrowseMode(config)) {
+      return false;
+    }
+    if (isFilteredBrowsePagingLocked({}) || enhancer.fetchInFlightPage || enhancer.nativeNavFetchInFlight ||
+        enhancer.dismissedBatchPrefetchInFlight || enhancer.carouselAdvancePending) {
+      return false;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var catalogCount = getVisibleCarouselCatalogCount(config);
+    if (catalogCount <= 0) {
+      if ((enhancer.globalPageIndex || 0) > 0) {
+        enhancer.globalPageIndex = 0;
+        enhancer.batchPageIndex = 0;
+        enhancer.lastAppliedSliceKey = '';
+        saveCarouselPagingState();
+        return true;
+      }
+      return false;
+    }
+    var maxFullPage = getMaxFullCarouselPageIndex(pageSize, catalogCount);
+    var currentPage = enhancer.globalPageIndex || 0;
+    if (currentPage > maxFullPage ||
+        !carouselPageFullyLoaded(currentPage, catalogCount, pageSize)) {
+      enhancer.globalPageIndex = maxFullPage;
+      enhancer.batchPageIndex = maxFullPage;
+      enhancer.lastAppliedSliceKey = '';
+      saveCarouselPagingState();
+      return true;
+    }
+    return false;
+  }
+
   function saveNativePoolSnapshot(config) {
     if (!config) {
+      return;
+    }
+    if (urlHasActiveNexusFilters() && !filteredBrowseHasEnoughCatalog(config)) {
       return;
     }
     var cards = collectCards(config);
@@ -2954,7 +8873,9 @@
     return Math.max(0, enhancer.tilePool.length - before);
   }
 
-  function fetchNativeNexusResultsPageViaNavigation(pageNum, config) {
+  function fetchNativeNexusResultsPageViaNavigation(pageNum, config, options) {
+    options = options || {};
+    var hardNavigation = options.hardNavigation !== false;
     if (!pageNum || pageNum < 2) {
       return Promise.resolve(false);
     }
@@ -2999,11 +8920,32 @@
       enhancer.nativeNavFetchResolver = resolve;
       enhancer.nativeNavFetchDeadline = Date.now() + 45000;
 
-      var navigated = navigateNexusResultsPageSoft(1);
+      var navigated = navigateNexusResultsPageSoft(1, {
+        forceSoft: options.forceSoftNavigation || urlHasActiveNexusFilters(),
+      });
+      if (!navigated) {
+        var pageLink = findNexusPaginationPageLink(pageNum);
+        if (pageLink) {
+          enhancer.allowNexusPaginationClick = true;
+          try {
+            pageLink.click();
+            navigated = true;
+          } catch (errPageLink) {
+            navigated = false;
+          }
+          setTimeout(function () {
+            enhancer.allowNexusPaginationClick = false;
+          }, 0);
+        }
+      }
       if (!navigated) {
         navigated = navigateNexusResultsPage(1);
       }
       if (!navigated) {
+        if (!hardNavigation) {
+          finishNativeNavFetch(false);
+          return;
+        }
         saveNativePoolSnapshot(config);
         try {
           window.location.assign(buildNexusResultsPageUrl(pageNum));
@@ -3061,28 +9003,64 @@
     });
   }
 
-  function fetchNativeNexusResultsPage(pageNum, config) {
+  function fetchNativeNexusResultsPage(pageNum, config, options) {
+    options = options || {};
+    var allowNavigation = options.allowNavigation;
+    var allowSoftNavigation = allowNavigation === true || allowNavigation === 'soft';
+    var allowHardNavigation = allowNavigation === true;
     if (!pageNum || pageNum < 2) {
       return Promise.resolve(false);
     }
     if (enhancer.fetchedNexusPages && enhancer.fetchedNexusPages[pageNum]) {
-      return Promise.resolve(true);
+      if (urlHasActiveNexusFilters() && pageNum === 2 && !filteredBrowseHasEnoughCatalog(config)) {
+        delete enhancer.fetchedNexusPages[pageNum];
+      } else {
+        return Promise.resolve(true);
+      }
     }
 
     var url = buildNexusResultsPageUrl(pageNum);
+    if (options.ignoreNumericFilters) {
+      try {
+        var batchUrl = new URL(url, window.location.href);
+        batchUrl.searchParams.delete('maxDownloads');
+        batchUrl.searchParams.delete('minDownloads');
+        batchUrl.searchParams.delete('maxEndorsements');
+        batchUrl.searchParams.delete('minEndorsements');
+        url = batchUrl.toString();
+      } catch (errBatchUrl) {
+        // Keep the constructed URL if URL normalization is unavailable.
+      }
+    }
+    var fetchController = typeof AbortController === 'function'
+      ? new AbortController()
+      : null;
+    var fetchTimeout = setTimeout(function () {
+      if (fetchController) {
+        fetchController.abort();
+      }
+    }, 2500);
     return fetch(url, {
       credentials: 'include',
       headers: { Accept: 'text/html,application/xhtml+xml' },
+      signal: fetchController ? fetchController.signal : undefined,
     }).then(function (response) {
       if (!response || !response.ok) {
         return null;
       }
       return response.text();
     }).then(function (html) {
+      clearTimeout(fetchTimeout);
       if (!html) {
         return false;
       }
-      var tiles = parseModTilesFromHtml(html, url);
+      var tiles = parseModTilesFromHtml(html, url, config);
+      if (!tiles || tiles.length === 0) {
+        return false;
+      }
+      if (urlHasActiveNexusFilters() && !options.ignoreNumericFilters) {
+        tiles = filterFreshTileElements(tiles, config, { minFresh: 4, allowFallback: false });
+      }
       if (!tiles || tiles.length === 0) {
         return false;
       }
@@ -3091,18 +9069,301 @@
         return false;
       }
       markNativeMergedPage(pageNum);
+      if (urlHasActiveNexusFilters()) {
+        enhancer.lastAppliedSliceKey = '';
+      }
       return true;
     }).catch(function () {
+      clearTimeout(fetchTimeout);
       return false;
     }).then(function (ok) {
       if (ok) {
         return true;
       }
-      return fetchNativeNexusResultsPageViaNavigation(pageNum, config);
+      if (!allowSoftNavigation) {
+        return false;
+      }
+      return fetchNativeNexusResultsPageViaNavigation(pageNum, config, {
+        hardNavigation: allowHardNavigation,
+      });
     });
   }
 
-  function fetchNexusBatchPage(pageNum, config) {
+  function resolveFilteredBatchNavigationMode(allowNavigation) {
+    if (allowNavigation === true || allowNavigation === 'soft') {
+      return allowNavigation;
+    }
+    if (allowNavigation === false) {
+      return false;
+    }
+    if (urlHasActiveNexusFilters()) {
+      return 'soft';
+    }
+    return false;
+  }
+
+  function ensureFilteredBrowseOnPageOne() {
+    if (getNexusResultsPageFromUrl() <= 1) {
+      return Promise.resolve(true);
+    }
+    return new Promise(function (resolve) {
+      var navigated = withNexusPaginationUnhidden(function () {
+        var pageOne = findNexusPaginationPageLink(1);
+        if (pageOne) {
+          enhancer.allowNexusPaginationClick = true;
+          try {
+            pageOne.click();
+          } catch (clickErr) {
+            enhancer.allowNexusPaginationClick = false;
+            return navigateNexusResultsPageSoft(-1, { forceSoft: true });
+          }
+          setTimeout(function () {
+            enhancer.allowNexusPaginationClick = false;
+          }, 0);
+          return true;
+        }
+        return navigateNexusResultsPageSoft(-1, { forceSoft: true });
+      });
+      if (!navigated) {
+        resolve(false);
+        return;
+      }
+      var deadline = Date.now() + 12000;
+      var pollId = setInterval(function () {
+        if (getNexusResultsPageFromUrl() <= 1) {
+          clearInterval(pollId);
+          resolve(true);
+          return;
+        }
+        if (Date.now() > deadline) {
+          clearInterval(pollId);
+          resolve(false);
+        }
+      }, 200);
+    });
+  }
+
+  function withNexusPaginationUnhidden(fn) {
+    var hidden = document.querySelectorAll('.vortex-enhanced-nexus-pagination-hide');
+    var restored = [];
+    for (var i = 0; i < hidden.length; i++) {
+      hidden[i].classList.remove('vortex-enhanced-nexus-pagination-hide');
+      restored.push(hidden[i]);
+    }
+    try {
+      return fn();
+    } finally {
+      for (var j = 0; j < restored.length; j++) {
+        restored[j].classList.add('vortex-enhanced-nexus-pagination-hide');
+      }
+    }
+  }
+
+  function navigateFilteredBrowseBatchPageSoft(pageNum) {
+    return withNexusPaginationUnhidden(function () {
+      var pageLink = findNexusPaginationPageLink(pageNum);
+      if (pageLink) {
+        enhancer.pendingPoolFetch = true;
+        saveCarouselPagingState();
+        enhancer.allowNexusPaginationClick = true;
+        try {
+          pageLink.click();
+        } catch (clickErr) {
+          enhancer.allowNexusPaginationClick = false;
+          return false;
+        }
+        setTimeout(function () {
+          enhancer.allowNexusPaginationClick = false;
+        }, 0);
+        return true;
+      }
+      return navigateNexusResultsPageSoft(1, { forceSoft: true });
+    });
+  }
+
+  function returnFilteredBrowseToPageOne() {
+    return ensureFilteredBrowseOnPageOne();
+  }
+
+  function fetchFilteredBrowseBatchViaSoftNav(pageNum, config) {
+    if (!pageNum || pageNum < 2 || !browseUsesFilteredCatalogPaging()) {
+      return Promise.resolve(false);
+    }
+    if (enhancer.nativeNavFetchInFlight) {
+      return Promise.resolve(false);
+    }
+    var minFreshTiles = 4;
+
+    return ensureFilteredBrowsePageOnePooled(config).then(function (seeded) {
+      if (!seeded) {
+        return false;
+      }
+      var startIds = collectLiveModIdSet(config);
+      enhancer.nativeNavFetchInFlight = true;
+      enhancer.pendingNativeCatalogFetch = true;
+      enhancer.pendingPoolFetch = true;
+
+      return new Promise(function (resolve) {
+        var navigated = navigateFilteredBrowseBatchPageSoft(pageNum);
+        if (!navigated) {
+          finishNativeNavFetch(false);
+          resolve(false);
+          return;
+        }
+        var deadline = Date.now() + 8000;
+        var pollId = setInterval(function () {
+          if (Date.now() > deadline) {
+            clearInterval(pollId);
+            returnFilteredBrowseToPageOne();
+            finishNativeNavFetch(false);
+            resolve(false);
+            return;
+          }
+          var cfg = enhancer.config || config;
+          var urlPage = getNexusResultsPageFromUrl();
+          var liveCards = collectLiveGridCards(cfg);
+          if (liveCards.length < minFreshTiles && urlPage < pageNum) {
+            return;
+          }
+          var added = mergeLiveGridIntoPool(cfg);
+          if (added < minFreshTiles) {
+            var freshTiles = [];
+            for (var i = 0; i < liveCards.length; i++) {
+              var modId = liveCards[i].modId;
+              if (modId && !startIds[String(modId)]) {
+                var clone = liveCards[i].card.cloneNode(true);
+                clone.setAttribute('data-vortex-pool-tile', 'true');
+                freshTiles.push(clone);
+              }
+            }
+            if (freshTiles.length >= minFreshTiles) {
+              added = appendFetchedTilesToPool(freshTiles, cfg);
+            }
+          }
+          if (added < minFreshTiles) {
+            return;
+          }
+          clearInterval(pollId);
+          var ok = added >= minFreshTiles;
+          if (ok) {
+            markNativeMergedPage(pageNum);
+            enhancer.lastAppliedSliceKey = '';
+            enhancer.fetchedNexusPages = enhancer.fetchedNexusPages || {};
+            enhancer.fetchedNexusPages[pageNum] = true;
+          }
+          returnFilteredBrowseToPageOne().then(function () {
+            finishNativeNavFetch(ok);
+            if (ok && window.__vortexBrowseEnhancer) {
+              mergeFilteredPoolIntoCarouselCatalog(enhancer.config || config);
+            }
+            resolve(ok);
+          });
+        }, 250);
+      });
+    });
+  }
+
+  function fetchFilteredBrowseBatchPage(pageNum, config, offset, allowNavigation, finishBatchFetch, appendGraphqlBatchResult) {
+    ensureFilteredBrowsePoolSeeded(config);
+    var freshOpts = { minFresh: 1, allowFallback: true };
+
+    function processGraphqlResult(pageResult) {
+      if (!pageResult || !pageResult.nodes || !pageResult.nodes.length) {
+        return false;
+      }
+      var nodes = filterFreshGraphqlNodes(pageResult.nodes, config, freshOpts);
+      if (nodes.length < freshOpts.minFresh) {
+        return false;
+      }
+      if (appendGraphqlBatchResult({ nodes: nodes, totalCount: pageResult.totalCount })) {
+        return finishBatchFetch(true);
+      }
+      return false;
+    }
+
+    function tryGraphqlBatch() {
+      return fetchModsListingBatchFromPageState(offset, 80).then(function (pageResult) {
+        if (pageResult && pageResult.nodes && pageResult.nodes.length) {
+          return processGraphqlResult(pageResult);
+        }
+        var variables = buildFilteredBatchGraphqlVariables(offset, 80, config);
+        return runModsListingGraphql(variables).then(processGraphqlResult);
+      });
+    }
+
+    function tryHostNavBatch() {
+      return fetchFilteredBrowseBatchViaHostNav(pageNum, config).then(finishBatchFetch);
+    }
+
+    function tryNativeNavBatch() {
+      return fetchFilteredBrowseBatchViaSoftNav(pageNum, config).then(finishBatchFetch);
+    }
+
+    function tryHtmlBatch() {
+      return fetchNativeNexusResultsPage(pageNum, config, { allowNavigation: allowNavigation || 'soft' }).then(function (htmlOk) {
+        if (htmlOk) {
+          return finishBatchFetch(true);
+        }
+        return false;
+      });
+    }
+
+    return ensureFilteredBrowsePageOnePooled(config).then(function (seeded) {
+      if (!seeded) {
+        return false;
+      }
+      return tryGraphqlBatch().then(function (graphqlOk) {
+        if (graphqlOk) {
+          return true;
+        }
+        return tryHostNavBatch().then(function (hostOk) {
+          if (hostOk) {
+            return true;
+          }
+          return tryHtmlBatch().then(function (htmlOk) {
+            if (htmlOk) {
+              return true;
+            }
+            return tryNativeNavBatch();
+          });
+        });
+      });
+    });
+  }
+
+  function fetchFilteredOrDefaultNexusBatchPage(pageNum, config, offset, allowNavigation, finishBatchFetch, appendGraphqlBatchResult) {
+    if (browseUsesFilteredCatalogPaging()) {
+      return fetchFilteredBrowseBatchPage(
+        pageNum,
+        config,
+        offset,
+        allowNavigation,
+        finishBatchFetch,
+        appendGraphqlBatchResult
+      );
+    }
+    var navMode = resolveFilteredBatchNavigationMode(allowNavigation);
+    return fetchModsListingBatch(offset, 80, config).then(function (result) {
+      if (appendGraphqlBatchResult(result)) {
+        return finishBatchFetch(true);
+      }
+      return fetchNativeNexusResultsPage(pageNum, config, { allowNavigation: navMode }).then(function (nativeOk) {
+        if (nativeOk) {
+          return finishBatchFetch(true);
+        }
+        if (!navMode) {
+          return finishBatchFetch(false);
+        }
+        return fetchNativeNexusResultsPageViaNavigation(pageNum, config, {
+          hardNavigation: navMode === true,
+        }).then(finishBatchFetch);
+      });
+    });
+  }
+
+  function fetchNexusBatchPage(pageNum, config, options) {
+    options = options || {};
+    var allowNavigation = options.allowNavigation !== false;
     if (config && config.onlyTracked) {
       return Promise.resolve(false);
     }
@@ -3111,7 +9372,11 @@
     }
     enhancer.fetchedNexusPages = enhancer.fetchedNexusPages || {};
     if (enhancer.fetchedNexusPages[pageNum]) {
-      return Promise.resolve(true);
+      if (urlHasActiveNexusFilters() && pageNum === 2 && !filteredBrowseHasEnoughCatalog(config)) {
+        delete enhancer.fetchedNexusPages[pageNum];
+      } else {
+        return Promise.resolve(true);
+      }
     }
     if (enhancer.fetchInFlightPage === pageNum) {
       return Promise.resolve(false);
@@ -3130,33 +9395,42 @@
       if (!result || !result.nodes || result.nodes.length === 0) {
         return false;
       }
+      var nodes = browseUsesFilteredCatalogPaging()
+        ? filterFreshGraphqlNodes(result.nodes, config, { minFresh: 4, allowFallback: false })
+        : result.nodes;
+      if (browseUsesFilteredCatalogPaging() && nodes.length < 4) {
+        return false;
+      }
       var tiles = [];
-      for (var i = 0; i < result.nodes.length; i++) {
-        tiles.push(buildGraphQLModTile(result.nodes[i]));
+      for (var i = 0; i < nodes.length; i++) {
+        tiles.push(buildGraphQLModTile(nodes[i]));
       }
       var added = appendFetchedTilesToPool(tiles, config);
       if (added <= 0) {
         return false;
       }
       enhancer.fetchedNexusPages[pageNum] = true;
+      if (browseUsesFilteredCatalogPaging()) {
+        enhancer.lastAppliedSliceKey = '';
+      }
       return true;
     }
 
-    return fetchModsListingBatch(offset, 80, config).then(function (result) {
-      if (appendGraphqlBatchResult(result)) {
-        return finishBatchFetch(true);
-      }
-      return fetchNativeNexusResultsPage(pageNum, config).then(function (htmlOk) {
-        if (htmlOk) {
-          return finishBatchFetch(true);
-        }
-        return fetchNativeNexusResultsPageViaNavigation(pageNum, config).then(finishBatchFetch);
-      });
-    });
+    return fetchFilteredOrDefaultNexusBatchPage(
+      pageNum,
+      config,
+      offset,
+      allowNavigation,
+      finishBatchFetch,
+      appendGraphqlBatchResult
+    );
   }
 
   function needsUpcomingBatchFetch(visibleCount, pageSize) {
     var catalogAvailable = getCatalogAvailableCount(visibleCount);
+    if (!usesMergedCarouselPool()) {
+      return ((enhancer.globalPageIndex || 0) + 1) * pageSize >= catalogAvailable;
+    }
     var needForNextPage = (enhancer.globalPageIndex + 1) * pageSize;
     var needForPageAfterNext = (enhancer.globalPageIndex + 2) * pageSize;
     var needEarly = (enhancer.globalPageIndex + 3) * pageSize;
@@ -3167,7 +9441,28 @@
       catalogAvailable < needForFullPageFour;
   }
 
+  function filteredBrowseNeedsMoreCatalogPages(config) {
+    config = config || enhancer.config || {};
+    if (!isFilteredBrowseSession(config)) {
+      return false;
+    }
+    var pageSize = getCarouselPageSize(config);
+    var visibleCount = getVisibleCarouselCatalogCount(config);
+    var needForNext = (enhancer.globalPageIndex + 1) * pageSize;
+    return visibleCount < needForNext;
+  }
+
   function getNextUnfetchedNexusPage() {
+    if (browseUsesFilteredCatalogPaging()) {
+      clearStaleFilteredBatchFetchFlags();
+      if (!filteredBrowseHasEnoughCatalog() || filteredBrowseNeedsMoreCatalogPages()) {
+        var forcedPage = getNextNexusPageToFetch();
+        if (forcedPage > getNexusResultsPageFromUrl()) {
+          return forcedPage;
+        }
+        return 2;
+      }
+    }
     var nextPage = getNextNexusPageToFetch();
     return nextPage > getNexusResultsPageFromUrl() ? nextPage : null;
   }
@@ -3176,11 +9471,18 @@
     if (config && config.onlyTracked) {
       return;
     }
+    if (urlHasActiveNexusFilters() && (enhancer.globalPageIndex || 0) < 2) {
+      return;
+    }
     if (isCarouselQuietPeriod()) {
       return;
     }
     if (enhancer.pendingPoolFetch || enhancer.pendingNexusBatchAdvance || enhancer.fetchInFlightPage ||
         enhancer.nativeNavFetchInFlight || enhancer.pendingNativeCatalogFetch) {
+      return;
+    }
+    if (isPooledNexusCarouselBrowseMode(config)) {
+      maybePrefetchDismissedLiveBatch(config);
       return;
     }
 
@@ -3196,14 +9498,14 @@
       return;
     }
 
-    fetchNexusBatchPage(nextPage, config).then(function (ok) {
+    fetchNexusBatchPage(nextPage, config, { allowNavigation: false }).then(function (ok) {
       if (ok) {
         enhancer.scheduleScan(true);
       }
     });
   }
 
-  function beginNexusBatchFetch(config) {
+  function beginNexusBatchFetch(config, options) {
     if (config && config.onlyTracked) {
       return Promise.resolve(false);
     }
@@ -3211,7 +9513,7 @@
     if (!nextPage) {
       return Promise.resolve(false);
     }
-    return fetchNexusBatchPage(nextPage, config);
+    return fetchNexusBatchPage(nextPage, config, options);
   }
 
   function findNexusModGridFromTiles() {
@@ -3291,7 +9593,7 @@
     var rows = config.gridRows || 3;
     grid.style.setProperty('--vortex-grid-cols', String(cols));
     grid.style.setProperty('--vortex-grid-rows', String(rows));
-    var cardHeight = Math.max(418, Math.min(492, Math.floor((window.innerHeight - 96) / rows)));
+    var cardHeight = Math.max(140, Math.min(492, Math.floor((window.innerHeight - 126) / rows)));
     grid.style.setProperty('--vortex-card-height', String(cardHeight) + 'px');
     grid.style.setProperty('--vortex-thumb-height', String(Math.max(145, Math.round(cardHeight * 0.36))) + 'px');
   }
@@ -4176,7 +10478,7 @@
     var orFilters = buildModIdListingOrFilters(modIds, config);
 
     var tagsExclude = [];
-    if (enhancer.clientHideTranslations || enhancer.forceDefaultFilters) {
+    if (shouldApplyTranslationFilter()) {
       tagsExclude.push('Translation');
     }
 
@@ -4195,7 +10497,7 @@
       },
     };
 
-    if ((enhancer.clientHideTranslations || enhancer.forceDefaultFilters)) {
+    if (shouldApplyTranslationFilter()) {
       variables.postFilter.categoryName = [{ op: 'NOT_EQUALS', value: 'Translation' }];
     }
 
@@ -4845,9 +11147,12 @@
 
     var liveCards = collectLiveGridCards(config);
     if (liveCards.length === 0) {
+      if (shouldDeferDismissLayoutCollapse() || isTranslationFilterDismissedBrowse()) {
+        return false;
+      }
       var reloadUrl = enhancer.lastGoodBrowseUrl || window.location.href;
       if (reloadUrl && reloadUrl.indexOf('nexusmods.com') >= 0) {
-        sendToHost({ type: 'browse-navigate', url: appendBrowseReloadParam(reloadUrl) });
+        sendBrowseNavigateToHost(stripInternalBrowseParams(reloadUrl));
       }
       return false;
     }
@@ -5203,6 +11508,13 @@
       return Object.keys(config.installed || {}).length;
     }
 
+    if (isFilteredBrowseSession(config) || isNexusFilteredBrowse() || hasNumericNexusBrowseFilters()) {
+      var pinnedFilteredTotal = getFilteredBrowseDisplayTotal();
+      if (pinnedFilteredTotal > 0) {
+        return pinnedFilteredTotal;
+      }
+    }
+
     var nexusTotal = parseNexusResultsTotal();
     var base = nexusTotal && nexusTotal > 0 ? nexusTotal : Math.max(visibleCount || 0, 0);
 
@@ -5261,6 +11573,36 @@
     return cards.filter(function (entry) {
       return !entry.card.classList.contains('vortex-enhanced-hidden');
     });
+  }
+
+  function findNexusPaginationPageLink(pageNum) {
+    if (!pageNum || pageNum < 1) {
+      return null;
+    }
+    var target = String(pageNum);
+    var navs = document.querySelectorAll('.vortex-enhanced-nexus-pagination-hide, nav, [role="navigation"]');
+    for (var n = 0; n < navs.length; n++) {
+      var nav = navs[n];
+      if (!nav.querySelector('[aria-current="page"]')) {
+        continue;
+      }
+      var links = nav.querySelectorAll('a, button');
+      for (var j = 0; j < links.length; j++) {
+        var link = links[j];
+        if (isInsideCarouselControls(link)) {
+          continue;
+        }
+        if (link.disabled || link.getAttribute('aria-disabled') === 'true') {
+          continue;
+        }
+        var text = (link.textContent || '').trim();
+        var aria = (link.getAttribute('aria-label') || '').trim();
+        if (text === target || aria === ('Page ' + target) || aria === ('Go to page ' + target)) {
+          return link;
+        }
+      }
+    }
+    return null;
   }
 
   function findNexusPaginationButton(direction) {
@@ -5386,7 +11728,7 @@
   }
 
   function getBrowseSessionKey() {
-    var key = getBrowseSessionKeyFromHref(window.location.href);
+    var key = getBrowseSessionKeyFromHref(getActiveBrowseHref());
     if (key) {
       return key;
     }
@@ -5416,7 +11758,9 @@
     if (node.classList && (
         node.classList.contains('vortex-enhanced-results-toolbar') ||
         node.classList.contains('vortex-enhanced-sort-toolbar-row') ||
-        node.classList.contains('vortex-enhanced-controls-bar-fallback')
+        node.classList.contains('vortex-enhanced-controls-bar-fallback') ||
+        node.classList.contains('vortex-enhanced-nexus-active-filters') ||
+        node.classList.contains('vortex-enhanced-nexus-active-filters-shell')
     )) {
       return true;
     }
@@ -5551,6 +11895,8 @@
     enhancer.nexusPageSizePending = false;
     enhancer.filteredFillAttempts = 0;
     enhancer.filteredFillInFlight = false;
+    enhancer.filteredBrowsePoolSessionKey = '';
+    enhancer.filteredBrowseStableSessionKey = '';
     enhancer.trackedCatalogActive = false;
     enhancer.trackedCatalogKey = '';
     enhancer.trackedCatalogLoadedPage = -1;
@@ -5574,10 +11920,17 @@
   }
 
   function resetTranslationFilters() {
-    enhancer.hideTranslationsApplied = true;
-    enhancer.clientHideTranslations = true;
-    enhancer.preferHideTranslations = true;
-    enhancer.forceDefaultFilters = true;
+    if (enhancer.userDismissedTranslationFilter) {
+      enhancer.hideTranslationsApplied = false;
+      enhancer.clientHideTranslations = false;
+      enhancer.preferHideTranslations = false;
+      enhancer.forceDefaultFilters = false;
+    } else {
+      enhancer.hideTranslationsApplied = true;
+      enhancer.clientHideTranslations = true;
+      enhancer.preferHideTranslations = true;
+      enhancer.forceDefaultFilters = true;
+    }
     enhancer.filtersOpenAttempts = 0;
     enhancer.translationUrlApplied = false;
     enhancer.translationUrlPending = false;
@@ -5646,7 +11999,7 @@
         hide = true;
       }
 
-      if ((enhancer.hideTranslationsApplied || enhancer.clientHideTranslations) && isTranslationModCard(card)) {
+      if (shouldFilterTranslationsClientSide() && isTranslationModCard(card)) {
         hide = true;
       }
 
@@ -5840,6 +12193,500 @@
     scheduleModEnrichment(config, modIds);
   }
 
+  function queryVisibleFilteredCarouselTiles(grid) {
+    if (!grid) {
+      return [];
+    }
+    return Array.prototype.slice.call(grid.querySelectorAll(
+      ':scope > [data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-hidden)'
+    ));
+  }
+
+  function dedupeLiveGridModTiles(config) {
+    if (!config || !(urlHasActiveNexusFilters() || hasNumericNexusBrowseFilters() || isFilteredBrowseSession(config))) {
+      return 0;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return 0;
+    }
+    var tiles = queryLiveGridModTiles(grid, { minDirect: 1 });
+    if (tiles.length < 25) {
+      return 0;
+    }
+    var keep = {};
+    var hidden = 0;
+    for (var i = tiles.length - 1; i >= 0; i--) {
+      var tile = tiles[i];
+      var modId = extractModIdFromTile(tile);
+      if (!modId) {
+        continue;
+      }
+      var key = String(modId);
+      if (keep[key]) {
+        tile.classList.add('vortex-enhanced-carousel-hidden');
+        tile.style.setProperty('display', 'none', 'important');
+        hidden++;
+      } else {
+        keep[key] = true;
+      }
+    }
+    return hidden;
+  }
+
+  function scheduleFilteredBrowseConfigTouch(config, prevConfig, nextConfig) {
+    if (!config || !isFilteredBrowseSession(config)) {
+      return;
+    }
+    if (nextConfig && nextConfig.filterBrowseActive && (!prevConfig || !prevConfig.filterBrowseActive)) {
+      resetFilteredBrowseCatalogState();
+      resetFilteredBrowseTotalsState();
+      enhancer.globalPageIndex = 0;
+      enhancer.batchPageIndex = 0;
+      enhancer.lastAppliedSliceKey = '';
+      return;
+    }
+    if (enhancer.footerActionQuietUntil && Date.now() < enhancer.footerActionQuietUntil) {
+      return;
+    }
+    if (enhancer.filteredBrowseConfigTouchTimer) {
+      clearTimeout(enhancer.filteredBrowseConfigTouchTimer);
+      enhancer.filteredBrowseConfigTouchTimer = null;
+    }
+    enhancer.filteredBrowseConfigTouchTimer = setTimeout(function () {
+      enhancer.filteredBrowseConfigTouchTimer = null;
+      var cfg = enhancer.config || config;
+      if (!cfg || !isFilteredBrowseSession(cfg)) {
+        return;
+      }
+      if (shouldUseNumericFilteredBrowseScan(cfg)) {
+        return;
+      }
+      if (enhancer.footerActionQuietUntil && Date.now() < enhancer.footerActionQuietUntil) {
+        return;
+      }
+      if (gridVisibleTilesNeedDecoration(cfg)) {
+        decorateVisibleFilteredCarouselTiles(cfg);
+      }
+    }, 450);
+  }
+
+  function scheduleFilteredBrowseGridRefresh(config) {
+    if (!config || !isFilteredBrowseSession(config)) {
+      return;
+    }
+    var now = Date.now();
+    if (enhancer.filteredBrowseGridRefreshWindowStart && now - enhancer.filteredBrowseGridRefreshWindowStart < 5000) {
+      if ((enhancer.filteredBrowseGridRefreshCount || 0) >= 4) {
+        return;
+      }
+    } else {
+      enhancer.filteredBrowseGridRefreshWindowStart = now;
+      enhancer.filteredBrowseGridRefreshCount = 0;
+    }
+    if (enhancer.filteredBrowseGridRefreshTimer) {
+      clearTimeout(enhancer.filteredBrowseGridRefreshTimer);
+      enhancer.filteredBrowseGridRefreshTimer = null;
+    }
+    enhancer.filteredBrowseGridRefreshTimer = setTimeout(function () {
+      enhancer.filteredBrowseGridRefreshTimer = null;
+      if (!isFilteredBrowseSession(config)) {
+        return;
+      }
+      if (enhancer.filteredBrowseObserverBusy || enhancer.filteredBrowseEnhanceInFlight) {
+        return;
+      }
+      if (enhancer.footerActionQuietUntil && Date.now() < enhancer.footerActionQuietUntil) {
+        return;
+      }
+      enhancer.filteredBrowseGridRefreshCount = (enhancer.filteredBrowseGridRefreshCount || 0) + 1;
+      enhancer.filteredBrowseObserverBusy = true;
+      try {
+        if (gridVisibleTilesNeedDecoration(config)) {
+          decorateVisibleFilteredCarouselTiles(config);
+        }
+      } finally {
+        enhancer.filteredBrowseObserverBusy = false;
+      }
+    }, 450);
+  }
+
+  function ensureFilteredBrowseGridObserver(config) {
+    if (enhancer.filteredBrowseGridObserver) {
+      enhancer.filteredBrowseGridObserver.disconnect();
+      enhancer.filteredBrowseGridObserver = null;
+      enhancer.filteredBrowseGridObserverHost = null;
+    }
+  }
+
+  function decorateVisibleFilteredCarouselTiles(config) {
+    if (!config) {
+      return 0;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return 0;
+    }
+    var tiles = queryVisibleFilteredCarouselTiles(grid);
+    if (tiles.length === 0) {
+      tiles = queryLiveGridModTiles(grid, { minDirect: 1 }).filter(filteredBrowseTileIsDisplayed);
+    }
+    var modIds = [];
+    var decorated = 0;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      tile.classList.remove('vortex-enhanced-nexus-live-hidden');
+      if (tile.style) {
+        tile.style.removeProperty('display');
+      }
+      var modId = extractModIdFromTile(tile);
+      var installedEntry = modId ? (config.installed[String(modId)] || null) : null;
+      decorateCard(tile, modId, installedEntry, config);
+      decorated++;
+      if (modId) {
+        modIds.push(modId);
+      }
+    }
+    if (modIds.length) {
+      scheduleModEnrichment(config, modIds);
+    }
+    return decorated;
+  }
+
+  function gridVisibleTilesNeedDecoration(config) {
+    if (!config || !isFilteredBrowseSession(config)) {
+      return false;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return true;
+    }
+    var tiles = queryVisibleFilteredCarouselTiles(grid);
+    if (tiles.length === 0) {
+      tiles = Array.prototype.slice.call(grid.querySelectorAll(
+        '[data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-hidden)'
+      ));
+    }
+    if (tiles.length < 4) {
+      return false;
+    }
+    var sample = Math.min(tiles.length, 8);
+    var missing = 0;
+    for (var i = 0; i < sample; i++) {
+      if (!tiles[i].querySelector('.vortex-enhanced-install, .vortex-enhanced-footer-actions, .vortex-enhanced-track')) {
+        missing++;
+      }
+    }
+    return missing >= Math.max(2, Math.floor(sample / 2));
+  }
+
+  function filteredBrowseTileIsDisplayed(tile) {
+    if (!tile) {
+      return false;
+    }
+    if (tile.classList.contains('vortex-enhanced-carousel-hidden') ||
+        tile.classList.contains('vortex-enhanced-hidden') ||
+        tile.classList.contains('vortex-enhanced-nexus-live-hidden')) {
+      return false;
+    }
+    if (tile.style && tile.style.display === 'none') {
+      return false;
+    }
+    return true;
+  }
+
+  function decorateFilteredPageTilesByModIds(config, showIds, pageEntries) {
+    if (!config || !showIds) {
+      return 0;
+    }
+    if (pageEntries && pageEntries.length) {
+      var directIds = [];
+      var directDecorated = 0;
+      for (var p = 0; p < pageEntries.length; p++) {
+        var entry = pageEntries[p];
+        if (!entry || !entry.card || !entry.modId) {
+          continue;
+        }
+        var directInstalled = config.installed[String(entry.modId)] || null;
+        decorateCard(entry.card, entry.modId, directInstalled, config);
+        directIds.push(entry.modId);
+        directDecorated++;
+      }
+      if (directIds.length) {
+        scheduleModEnrichment(config, directIds);
+      }
+      return directDecorated;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return 0;
+    }
+    var tiles = queryLiveGridModTiles(grid, { minDirect: 1, includePoolTiles: true });
+    var modIds = [];
+    var decorated = 0;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      var modId = extractModIdFromTile(tile);
+      if (!modId || !showIds[String(modId)]) {
+        continue;
+      }
+      tile.classList.remove(
+        'vortex-enhanced-carousel-hidden',
+        'vortex-enhanced-nexus-live-hidden',
+        'vortex-enhanced-hidden'
+      );
+      if (tile.style) {
+        tile.style.removeProperty('display');
+      }
+      var installedEntry = config.installed[String(modId)] || null;
+      decorateCard(tile, modId, installedEntry, config);
+      decorated++;
+      modIds.push(modId);
+    }
+    if (modIds.length) {
+      scheduleModEnrichment(config, modIds);
+    }
+    return decorated;
+  }
+
+  function decorateVisibleGridTiles(config, options) {
+    options = options || {};
+    if (!config) {
+      return 0;
+    }
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (!grid) {
+      return 0;
+    }
+    var tiles = queryLiveGridModTiles(grid, { minDirect: 1 });
+    var modIds = [];
+    var decorated = 0;
+    for (var i = 0; i < tiles.length; i++) {
+      var tile = tiles[i];
+      if (shouldUseNumericFilteredBrowseScan(config) &&
+          tile.classList.contains('vortex-enhanced-carousel-hidden')) {
+        continue;
+      }
+      if (!options.forceAll && !filteredBrowseTileIsDisplayed(tile)) {
+        continue;
+      }
+      tile.classList.remove('vortex-enhanced-nexus-live-hidden');
+      if (tile.style && !tile.classList.contains('vortex-enhanced-carousel-hidden')) {
+        tile.style.removeProperty('display');
+      }
+      var modId = extractModIdFromTile(tile);
+      var installedEntry = modId ? (config.installed[String(modId)] || null) : null;
+      decorateCard(tile, modId, installedEntry, config);
+      decorated++;
+      if (modId) {
+        modIds.push(modId);
+      }
+    }
+    if (modIds.length) {
+      scheduleModEnrichment(config, modIds);
+    }
+    return decorated;
+  }
+
+  function applyFilteredBrowseLiveOnlyPage(config, options) {
+    options = options || {};
+    if (!config || !isFilteredBrowseSession(config)) {
+      return 0;
+    }
+    if (enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil &&
+        !options.forcePageApply) {
+      return 0;
+    }
+    clearStaleFilteredBrowseFetchLocks();
+    ensureCarouselLayout(config);
+    restoreMainBrowseContentVisibility();
+    if (!(options.forcePageApply && options.skipDecorationRetry)) {
+      applyFiltersToAllGridTiles(config);
+      dedupeLiveGridModTiles(config);
+    }
+
+    var live = collectLiveGridCards(config);
+    if (live.length < 4 && getFilteredCarouselVisibleEntries(config).length < 4) {
+      var partialDecorated = decorateVisibleGridTiles(config, { forceAll: true });
+      scheduleFilteredBrowseRescan(200);
+      startFilteredBrowseDecorationWatchdog(config);
+      return partialDecorated;
+    }
+    var visible = getFilteredCarouselVisibleEntries(config);
+    var pageSize = getCarouselPageSize(config);
+    var currentPage = Math.max(0, enhancer.globalPageIndex || 0);
+    if (visible.length > 0) {
+      var clampedLivePage = clampFilteredBrowseLivePageIndex(pageSize, visible.length, currentPage, options);
+      if (clampedLivePage !== currentPage) {
+        currentPage = clampedLivePage;
+        enhancer.globalPageIndex = clampedLivePage;
+        enhancer.batchPageIndex = clampedLivePage;
+        saveCarouselPagingState();
+      }
+    }
+
+    var start = currentPage * pageSize;
+    var pageSlice = visible.slice(start, start + pageSize);
+    if (pageSlice.length === 0 && visible.length > 0) {
+      if (currentPage > 0) {
+        enhancer.pendingTargetPage = currentPage;
+        if (!enhancer.carouselAdvancePending && !enhancer.pendingNativeCatalogFetch) {
+          enhancer.carouselAdvancePending = true;
+          var pageFetchPromise = beginNexusBatchFetch(config, {
+            allowNavigation: 'soft',
+            forceSoftNavigation: true,
+          });
+          if (pageFetchPromise && typeof pageFetchPromise.then === 'function') {
+            pageFetchPromise.then(function (ok) {
+              enhancer.carouselAdvancePending = false;
+              enhancer.pendingTargetPage = null;
+              if (ok) {
+                mergeLiveGridIntoPool(config);
+                safeApplyFilteredBrowseLiveOnlyPage(config);
+              }
+            }).catch(function () {
+              enhancer.carouselAdvancePending = false;
+              enhancer.pendingTargetPage = null;
+            });
+          } else {
+            enhancer.carouselAdvancePending = false;
+            enhancer.pendingTargetPage = null;
+          }
+        }
+        return 0;
+      }
+      currentPage = 0;
+      enhancer.globalPageIndex = 0;
+      enhancer.batchPageIndex = 0;
+      start = 0;
+      pageSlice = visible.slice(0, pageSize);
+      saveCarouselPagingState();
+    }
+
+    var showIds = {};
+    var pageModIds = [];
+    for (var s = 0; s < pageSlice.length; s++) {
+      if (pageSlice[s].modId) {
+        showIds[String(pageSlice[s].modId)] = true;
+        pageModIds.push(pageSlice[s].modId);
+      }
+    }
+    pageModIds.sort(function (a, b) { return a - b; });
+
+    var grid = resolveNexusModGridElement() || findModGrid();
+    var stash = ensureLiveStashHost();
+    for (var showIdx = 0; showIdx < pageSlice.length; showIdx++) {
+      var sliceEntry = pageSlice[showIdx];
+      var sliceCard = sliceEntry && sliceEntry.card;
+      if (!sliceCard) {
+        continue;
+      }
+      if (grid && sliceCard.isConnected && grid.contains(sliceCard)) {
+        sliceCard.classList.remove(
+          'vortex-enhanced-carousel-hidden',
+          'vortex-enhanced-nexus-live-hidden',
+          'vortex-enhanced-hidden'
+        );
+        sliceCard.style.removeProperty('display');
+      } else if (grid) {
+        setCarouselTileVisibility(sliceCard, true, grid, null, stash);
+      }
+    }
+    if (grid) {
+      // Fetched cards retain data-vortex-pool-tile after being mounted in the
+      // live grid. Include them here or a prior fetched page remains visible
+      // while only the page counter advances.
+      grid.querySelectorAll(
+        '[data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden), ' +
+        '[data-e2eid="mod-tile"]:not([style*="display: none"])'
+      ).forEach(function (tile) {
+        var tileModId = extractModIdFromTile(tile);
+        var showTile = !!(tileModId && showIds[String(tileModId)]);
+        if (showTile) {
+          tile.classList.remove(
+            'vortex-enhanced-carousel-hidden',
+            'vortex-enhanced-nexus-live-hidden',
+            'vortex-enhanced-hidden'
+          );
+          tile.style.removeProperty('display');
+        } else {
+          tile.classList.add('vortex-enhanced-carousel-hidden');
+          tile.style.setProperty('display', 'none', 'important');
+        }
+      });
+    }
+    if (stash) {
+      stash.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').forEach(function (tile) {
+        var stashedModId = extractModIdFromTile(tile);
+        if (stashedModId && showIds[String(stashedModId)] && grid) {
+          setCarouselTileVisibility(tile, true, grid, null, stash);
+        } else {
+          tile.classList.add('vortex-enhanced-carousel-hidden');
+          tile.style.setProperty('display', 'none', 'important');
+        }
+      });
+    }
+
+    var decorated = decorateFilteredPageTilesByModIds(config, showIds, pageSlice);
+    if (decorated < Math.min(pageSlice.length, 4)) {
+      decorated = decorateVisibleGridTiles(config);
+    }
+    installCarouselWheelHandler();
+
+    var controlVisibleCount = getEffectiveResultsTotal(config, visible.length);
+    var batchPages = Math.max(1, Math.ceil(Math.max(controlVisibleCount, 1) / pageSize));
+    enhancer.batchPageIndex = currentPage;
+    enhancer.lastAppliedSliceKey = getCarouselSliceKey(pageSize, pageModIds);
+    updateCarouselControls(controlVisibleCount, batchPages, pageSize, currentPage);
+    ensureCarouselControlsBar();
+    protectBrowseControlsFromChromeHide();
+    hideBrowsePageFooter();
+    if (!options.skipHeadlineSync) {
+      pinNexusFilteredResultsTotal();
+      syncNexusFilteredResultsHeadlines();
+      scheduleFilteredResultsHeadlineResync();
+    } else {
+      refreshCarouselControlsFilteredTotal();
+    }
+    syncNexusResultsHeadline(config);
+
+    var visibleKey = pageModIds.join(',');
+    if (visibleKey !== enhancer.lastVisibleModsKey) {
+      enhancer.lastVisibleModsKey = visibleKey;
+      if (pageModIds.length > 0) {
+        sendToHost({ type: 'visible-mods', modIds: pageModIds });
+      }
+    }
+
+    decorated += decorateVisibleFilteredCarouselTiles(config);
+    if (!options.skipDecorationRetry) {
+      scheduleFilteredBrowseDecorationRetry(config);
+    }
+    return decorated;
+  }
+
+  function applyFilteredBrowseCarouselPage(config, cards) {
+    if (!config) {
+      return;
+    }
+    if (filteredBrowseUsesLiveCatalogOnly()) {
+      applyFilteredBrowseLiveOnlyPage(config);
+      return;
+    }
+    clearStaleFilteredBrowseFetchLocks();
+    ensureCarouselLayout(config);
+    restoreMainBrowseContentVisibility();
+    if (!cards || !cards.length) {
+      cards = collectCards(config);
+    }
+    applyDismissedCatalogCarouselPage(cards, config);
+    decorateVisibleGridTiles(config);
+    installCarouselWheelHandler();
+    hideBrowsePageFooter();
+    protectBrowseControlsFromChromeHide();
+    scheduleFilteredBrowseDecorationRetry(config);
+  }
+
   function refreshClientFilterCarousel(config) {
     if (!config || isLocalCatalogMode(config)) {
       return;
@@ -5871,6 +12718,16 @@
     }
     if (isOnlyTrackedLivePreview(config)) {
       showOnlyTrackedLoadingState(config);
+      return;
+    }
+    if (enhancer.nativeNavFetchInFlight || enhancer.pendingNativeCatalogFetch) {
+      if (!enhancer.filteredBrowseHostBatchInFlight ||
+          enhancer.filteredBrowseHostBatchPhase === 'forward') {
+        return;
+      }
+    }
+    if (isPooledNexusCarouselBrowseMode(config) && !filteredBrowseUsesLiveCatalogOnly()) {
+      applyDismissedCatalogCarouselPage(cards, config);
       return;
     }
     if (enhancer.applyingCarouselPage) {
@@ -5912,6 +12769,24 @@
     enhancer.batchPageIndex = Math.max(0, Math.floor(localStart / pageSize));
 
     var slice = visible.slice(localStart, localEnd);
+    if (slice.length < pageSize &&
+        localStart + pageSize > visible.length &&
+        enhancer.globalPageIndex > 0) {
+      var clampedPage = urlHasActiveNexusFilters()
+        ? clampFilteredBrowseLivePageIndex(pageSize, visible.length, enhancer.globalPageIndex, {})
+        : getMaxFullCarouselPageIndex(pageSize, visible.length);
+      if (enhancer.globalPageIndex > clampedPage) {
+        enhancer.globalPageIndex = clampedPage;
+        enhancer.batchPageIndex = clampedPage;
+        saveCarouselPagingState();
+        localStart = getCatalogSliceStart(pageSize);
+        localEnd = localStart + pageSize;
+        slice = visible.slice(localStart, localEnd);
+        if (isDismissedCarouselBrowseMode(config) && canFetchMoreCarouselBatches()) {
+          maybePrefetchDismissedLiveBatch(config);
+        }
+      }
+    }
     var pageModIds = [];
     for (var k = 0; k < slice.length; k++) {
       if (slice[k].modId) {
@@ -5948,13 +12823,40 @@
     }
 
     var useLiveOnlyPaging = !enhancer.tilePool || enhancer.tilePool.length === 0;
+    if (urlHasActiveNexusFilters() && filteredBrowseUsesLiveCatalogOnly()) {
+      useLiveOnlyPaging = true;
+    } else if (isDismissedCarouselBrowseMode(config) &&
+        !dismissedLiveGridCoversCarouselPage(config, enhancer.globalPageIndex || 0)) {
+      useLiveOnlyPaging = false;
+    } else if (!useLiveOnlyPaging && grid && sliceCardsSatisfiedByLiveGrid(slice, grid)) {
+      useLiveOnlyPaging = true;
+    }
     if (useLiveOnlyPaging && grid) {
       var sliceModIds = {};
+      var sliceConnected = false;
       for (var sm = 0; sm < slice.length; sm++) {
         if (slice[sm].modId) {
           sliceModIds[String(slice[sm].modId)] = true;
         }
+        if (slice[sm].card && slice[sm].card.isConnected) {
+          sliceConnected = true;
+        }
       }
+      if (slice.length > 0 && !sliceConnected) {
+        enhancer.lastAppliedSliceKey = '';
+        unhideAllCarouselTiles();
+        var freshCards = usesMergedCarouselPool() ? collectCards(config) : collectLiveGridCards(config);
+        applyFilters(freshCards, config);
+        visible = sortCatalogEntries(getVisibleCarouselCards(freshCards));
+        slice = visible.slice(localStart, localEnd);
+        sliceModIds = {};
+        for (var rf = 0; rf < slice.length; rf++) {
+          if (slice[rf].modId) {
+            sliceModIds[String(slice[rf].modId)] = true;
+          }
+        }
+      }
+      var matchedVisible = 0;
       grid.querySelectorAll('[data-e2eid="mod-tile"]').forEach(function (tile) {
         var tileModId = extractModIdFromTile(tile);
         var showTile = slice.length === 0 || !!(tileModId && sliceModIds[String(tileModId)]);
@@ -5965,8 +12867,28 @@
         if (!showTile) {
           tile.classList.add('vortex-enhanced-carousel-hidden');
           tile.style.setProperty('display', 'none', 'important');
+        } else {
+          matchedVisible++;
+          var installedEntry = tileModId ? (config.installed[String(tileModId)] || null) : null;
+          decorateCard(tile, tileModId, installedEntry, config);
         }
       });
+      if (slice.length > 0 && matchedVisible === 0) {
+        enhancer.lastAppliedSliceKey = '';
+        unhideAllCarouselTiles();
+        var fallbackCards = usesMergedCarouselPool() ? collectCards(config) : collectLiveGridCards(config);
+        applyFilters(fallbackCards, config);
+        visible = sortCatalogEntries(getVisibleCarouselCards(fallbackCards));
+        slice = visible.slice(localStart, localEnd);
+        for (var fb = 0; fb < slice.length; fb++) {
+          setCarouselTileVisibility(slice[fb].card, true, grid, poolHost, stash);
+          decorateCard(slice[fb].card, slice[fb].modId, slice[fb].installed, config);
+        }
+        updateCarouselControls(getEffectiveResultsTotal(config, visible.length),
+          Math.max(1, Math.ceil(Math.max(getEffectiveResultsTotal(config, visible.length), 1) / pageSize)),
+          pageSize, enhancer.batchPageIndex);
+        return;
+      }
     } else {
       hideAllCarouselTiles(grid, poolHost, stash);
     }
@@ -6005,6 +12927,20 @@
     }
 
     if (shown === 0 && slice.length > 0) {
+      for (var rescue = 0; rescue < slice.length; rescue++) {
+        setCarouselTileVisibility(slice[rescue].card, true, grid, poolHost, stash);
+        decorateCard(slice[rescue].card, slice[rescue].modId, slice[rescue].installed, config);
+        shown++;
+      }
+    }
+
+    if (shown === 0 && isDismissedCarouselBrowseMode(config) &&
+        !dismissedLiveGridCoversCarouselPage(config, enhancer.globalPageIndex || 0) &&
+        canFetchMoreCarouselBatches()) {
+      maybePrefetchDismissedLiveBatch(config);
+    }
+
+    if (shown === 0 && slice.length > 0) {
       return;
     }
 
@@ -6021,6 +12957,11 @@
     if (!config.onlyTracked) {
       maybePrefetchNextBatch(config, cards);
     }
+    if (isPooledNexusCarouselBrowseMode(config)) {
+      installCarouselWheelHandler();
+      hideBrowsePageFooter();
+      protectBrowseControlsFromChromeHide();
+    }
     } finally {
       enhancer.applyingCarouselPage = false;
     }
@@ -6028,6 +12969,9 @@
 
   function ensureFilteredCatalogFill(config) {
     if (config.onlyTracked) {
+      return;
+    }
+    if (isFilteredBrowseSession(config) && filteredBrowseUsesLiveCatalogOnly()) {
       return;
     }
     if (!hasClientCarouselFilters(config)) {
@@ -6055,7 +12999,7 @@
 
     enhancer.filteredFillInFlight = true;
     enhancer.filteredFillAttempts = (enhancer.filteredFillAttempts || 0) + 1;
-    beginNexusBatchFetch(config).then(function (ok) {
+    beginNexusBatchFetch(config, { allowNavigation: false }).then(function (ok) {
       enhancer.filteredFillInFlight = false;
       if (ok && window.__vortexBrowseEnhancer) {
         window.__vortexBrowseEnhancer.scheduleScan(true);
@@ -6085,7 +13029,51 @@
     return getBatchPageIndex();
   }
 
-  function updateCarouselControls(visibleCount, batchPages, pageSize, batchPage) {
+  function refreshCarouselControlsFilteredTotal(options) {
+    options = options || {};
+    if (enhancer.refreshingCarouselControlsFilteredTotal) {
+      return;
+    }
+    var config = enhancer.config;
+    if (!config || !document.querySelector('.vortex-enhanced-carousel-controls')) {
+      return;
+    }
+    enhancer.refreshingCarouselControlsFilteredTotal = true;
+    try {
+      var pageSize = getCarouselPageSize(config);
+      var visible = 0;
+      if (options.skipCatalogResolve) {
+        visible = (enhancer.filteredCarouselCatalog || []).length;
+      } else if (isFilteredBrowseSession(config)) {
+        visible = getFilteredCarouselVisibleEntries(config).length;
+      } else {
+        visible = collectCards(config).length;
+      }
+      var displayTotal = options.displayTotal > 0
+        ? options.displayTotal
+        : (getFilteredBrowseDisplayTotal() || getEffectiveResultsTotal(config, visible));
+      var catalogPages = options.catalogPages > 0
+        ? options.catalogPages
+        : Math.max(1, Math.ceil(Math.max(displayTotal, visible) / pageSize));
+      updateCarouselControls(
+        displayTotal,
+        catalogPages,
+        pageSize,
+        enhancer.globalPageIndex || 0,
+        {
+          skipCatalogResolve: !!options.skipCatalogResolve,
+          loadedCatalogCount: visible,
+          displayTotal: displayTotal,
+          catalogPages: catalogPages,
+        }
+      );
+    } finally {
+      enhancer.refreshingCarouselControlsFilteredTotal = false;
+    }
+  }
+
+  function updateCarouselControls(visibleCount, batchPages, pageSize, batchPage, options) {
+    options = options || {};
     var controls = document.querySelector('.vortex-enhanced-carousel-controls');
     if (!controls) {
       return;
@@ -6094,7 +13082,25 @@
     var config = enhancer.config || {};
     var pageDisplay = controls.querySelector('[data-carousel-page]');
     var countDisplay = controls.querySelector('[data-carousel-count]');
-    var catalogPages = getCarouselCatalogPages(pageSize, visibleCount, config);
+    var loadedCatalogCount = visibleCount;
+    if (isFilteredBrowseSession(config)) {
+      if (options.loadedCatalogCount != null) {
+        loadedCatalogCount = options.loadedCatalogCount;
+      } else {
+        loadedCatalogCount = enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0;
+        if (loadedCatalogCount <= 0 && !options.skipCatalogResolve) {
+          loadedCatalogCount = getFilteredCarouselVisibleEntries(config).length;
+        }
+      }
+    }
+    var catalogPages;
+    if (options.catalogPages > 0) {
+      catalogPages = options.catalogPages;
+    } else if (options.displayTotal > 0) {
+      catalogPages = Math.max(1, Math.ceil(options.displayTotal / pageSize));
+    } else {
+      catalogPages = getCarouselCatalogPages(pageSize, visibleCount, config);
+    }
 
     if (pageDisplay) {
       pageDisplay.textContent = 'Page ' + (enhancer.globalPageIndex + 1) + ' of ' + catalogPages;
@@ -6119,6 +13125,27 @@
       } else if (isLocalCatalogMode(config) && hasLocalCatalogData(config) && onPage === 0 &&
           !isTrackedCatalogReady(config)) {
         countDisplay.textContent = 'Loading catalog...';
+      } else if (isFilteredBrowseSession(config) || isNexusFilteredBrowse() ||
+          shouldUseNumericFilteredBrowseScan(config)) {
+        var filteredDisplayTotal = options.displayTotal > 0
+          ? options.displayTotal
+          : getLockedNexusFilteredDisplayTotal();
+        if (!filteredDisplayTotal && shouldUseNumericFilteredBrowseScan(config)) {
+          filteredDisplayTotal = Math.max(
+            visibleCount,
+            loadedCatalogCount,
+            (enhancer.filteredCarouselCatalog || []).length,
+            pageSize
+          );
+        }
+        if (!filteredDisplayTotal) {
+          filteredDisplayTotal = getFilteredBrowseDisplayTotal() ||
+            getEffectiveResultsTotal(config, visibleCount);
+        }
+        var filteredStart = enhancer.globalPageIndex * pageSize + 1;
+        var filteredEnd = Math.min(filteredStart + Math.max(onPage, pageSize) - 1, filteredDisplayTotal);
+        countDisplay.textContent = 'Showing ' + filteredStart + '\u2013' + filteredEnd +
+          ' of ' + filteredDisplayTotal + ' results \u00b7 ' + pageSize + ' per page';
       } else {
         var nexusTotal = parseNexusResultsTotal();
         var displayTotal = visibleCount > 0 ? visibleCount : (nexusTotal || 0);
@@ -6144,13 +13171,48 @@
     }
     if (nextBtn) {
       var nextPageStart = (enhancer.globalPageIndex + 1) * pageSize;
-      var hasLoadedNext = nextPageStart < visibleCount;
+      var hasLoadedNext = isFilteredBrowseSession(config)
+        ? nextPageStart < loadedCatalogCount
+        : nextPageStart < visibleCount;
       if (config.onlyTracked && hasTrackedCatalogData(config)) {
         nextBtn.disabled = catalogPages > 0 && (enhancer.globalPageIndex + 1) >= catalogPages;
       } else if (isLocalCatalogMode(config) && hasLocalCatalogData(config)) {
         nextBtn.disabled = catalogPages > 0 && (enhancer.globalPageIndex + 1) >= catalogPages;
       } else if (hasClientCarouselFilters(config)) {
         nextBtn.disabled = !hasLoadedNext && !canFetchMoreCarouselBatches();
+      } else if (isFilteredBrowseSession(config) || shouldUseNumericFilteredBrowseScan(config)) {
+        var filteredCanFetch = canFetchMoreCarouselBatches();
+        var filteredLoadedCount = options.loadedCatalogCount != null
+          ? options.loadedCatalogCount
+          : (enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0);
+        if (filteredLoadedCount <= 0 && !options.skipCatalogResolve &&
+            !shouldUseNumericFilteredBrowseScan(config)) {
+          filteredLoadedCount = getFilteredCarouselVisibleEntries(config).length;
+        }
+        if (filteredLoadedCount <= 0 && shouldUseNumericFilteredBrowseScan(config)) {
+          filteredLoadedCount = document.querySelectorAll(
+            '[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])'
+          ).length;
+        }
+        var filteredLoadedNext = (enhancer.globalPageIndex + 1) * pageSize < filteredLoadedCount;
+        var filteredNexusTotal = options.displayTotal > 0
+          ? options.displayTotal
+          : getLockedNexusFilteredDisplayTotal();
+        if (!filteredNexusTotal && shouldUseNumericFilteredBrowseScan(config)) {
+          filteredNexusTotal = Math.max(filteredLoadedCount, visibleCount, pageSize * 2);
+        }
+        if (!filteredNexusTotal && !shouldUseNumericFilteredBrowseScan(config)) {
+          filteredNexusTotal = getFilteredBrowseDisplayTotal() || parseNexusResultsTotal() || 0;
+        }
+        var filteredTotalPages = filteredNexusTotal > 0
+          ? Math.max(catalogPages, Math.ceil(filteredNexusTotal / pageSize))
+          : catalogPages;
+        var filteredAtEnd = filteredTotalPages > 0 &&
+          (enhancer.globalPageIndex + 1) >= filteredTotalPages;
+        nextBtn.disabled = !filteredLoadedNext && !hasLoadedNext && !filteredCanFetch && filteredAtEnd;
+        if (!filteredLoadedNext && !hasLoadedNext && (filteredCanFetch || filteredLoadedCount >= pageSize)) {
+          nextBtn.disabled = false;
+        }
       } else {
         var needsNexusFetch = !hasLoadedNext;
         var canFetchMore = canFetchMoreCarouselBatches();
@@ -6232,8 +13294,12 @@
       enhancer.carouselAdvancePending = false;
       saveCarouselPagingState();
       enhancer.pendingTargetPage = null;
-      applyLiveCarouselPage(cards, config);
-      decorateVisibleCarouselSlice(cards, config);
+      if (urlHasActiveNexusFilters()) {
+        applyFilteredBrowseCarouselPage(config, cards);
+      } else {
+        applyLiveCarouselPage(cards, config);
+        decorateVisibleCarouselSlice(cards, config);
+      }
       scrollCarouselIntoView();
       return;
     }
@@ -6241,7 +13307,11 @@
     if (!canFetchMoreCarouselBatches()) {
       enhancer.carouselAdvancePending = false;
       clampGlobalPageIndex(pageSize, visible.length);
-      applyLiveCarouselPage(cards, config);
+      if (urlHasActiveNexusFilters()) {
+        applyFilteredBrowseCarouselPage(config, cards);
+      } else {
+        applyLiveCarouselPage(cards, config);
+      }
       return;
     }
 
@@ -6250,7 +13320,11 @@
         enhancer.carouselAdvancePending = false;
         var stale = collectCards(config);
         clampGlobalPageIndex(pageSize, getVisibleCarouselCards(stale).length);
-        applyLiveCarouselPage(stale, config);
+        if (urlHasActiveNexusFilters()) {
+          applyFilteredBrowseCarouselPage(config, stale);
+        } else {
+          applyLiveCarouselPage(stale, config);
+        }
         return;
       }
       tryAdvanceFilteredForward(config, attempt + 1);
@@ -6288,16 +13362,783 @@
     scrollCarouselIntoView();
   }
 
+  function clearFilteredBrowseLocksForPaging() {
+    if (enhancer.filteredBrowseHostBatchInFlight) {
+      if (enhancer.filteredBrowseHostBatchDeadline &&
+          Date.now() > enhancer.filteredBrowseHostBatchDeadline) {
+        finishFilteredBrowseHostBatch(false);
+      }
+      return;
+    }
+    enhancer.pendingNativeCatalogFetch = false;
+    enhancer.nativeNavFetchInFlight = false;
+    enhancer.pendingPoolFetch = false;
+    enhancer.fetchInFlightPage = null;
+    enhancer.dismissedBatchPrefetchInFlight = false;
+  }
+
+  function clearStaleFilteredBrowseFetchLocks() {
+    if (enhancer.clearingFilteredBrowseLocks) {
+      return;
+    }
+    enhancer.clearingFilteredBrowseLocks = true;
+    try {
+      if (enhancer.filteredBrowseHostBatchInFlight &&
+          enhancer.filteredBrowseHostBatchDeadline &&
+          Date.now() > enhancer.filteredBrowseHostBatchDeadline) {
+        finishFilteredBrowseHostBatch(false);
+      }
+      if (urlHasActiveNexusFilters()) {
+        var liveOnly = isFilteredBrowseSession() &&
+          !(getVisibleCarouselCatalogCount() >= filteredBrowseBatchCatalogThreshold() ||
+            (enhancer.tilePool && enhancer.tilePool.length >= filteredBrowseBatchCatalogThreshold()));
+        if (liveOnly) {
+          if (!enhancer.filteredBrowseHostBatchInFlight) {
+            enhancer.pendingNativeCatalogFetch = false;
+            enhancer.nativeNavFetchInFlight = false;
+            enhancer.pendingPoolFetch = false;
+            enhancer.fetchInFlightPage = null;
+            enhancer.carouselAdvancePending = false;
+            enhancer.dismissedBatchPrefetchInFlight = false;
+          }
+          return;
+        }
+      }
+      if (enhancer.filteredBrowseHostBatchInFlight) {
+        return;
+      }
+      if (enhancer.pendingNativeCatalogFetch && !enhancer.nativeNavFetchInFlight) {
+        enhancer.pendingNativeCatalogFetch = false;
+        enhancer.pendingPoolFetch = false;
+        enhancer.fetchInFlightPage = null;
+        enhancer.dismissedBatchPrefetchInFlight = false;
+      }
+    } finally {
+      enhancer.clearingFilteredBrowseLocks = false;
+    }
+  }
+
+  function applyFilteredCarouselPageView(config, options) {
+    options = options || {};
+    if (isFilteredBrowseSession(config)) {
+      applyFilteredNexusDirectPage(config, options);
+      return;
+    }
+    if (filteredBrowseUsesLiveCatalogOnly()) {
+      safeApplyFilteredBrowseLiveOnlyPage(config, options);
+      return;
+    }
+    enhancer.lastAppliedSliceKey = '';
+    applyFilteredBrowseCarouselPage(config, collectCards(config));
+  }
+
+  function waitForFilteredNexusPageLoad(targetNexusPage, config, options) {
+    options = options || {};
+    var minTiles = options.minTiles || 4;
+    var startModIds = options.startModIds || null;
+    var deadline = Date.now() + (options.timeoutMs || 20000);
+    return new Promise(function (resolve) {
+      var pollId = setInterval(function () {
+        if (Date.now() > deadline) {
+          clearInterval(pollId);
+          resolve(false);
+          return;
+        }
+        if (isBrowseOopsPage()) {
+          clearInterval(pollId);
+          resolve(false);
+          return;
+        }
+        if (filteredNexusPageReady(targetNexusPage, startModIds, config, minTiles)) {
+          clearInterval(pollId);
+          resolve(true);
+        }
+      }, 200);
+    });
+  }
+
+  function clickFilteredNexusPaginationTarget(targetNexusPage, direction) {
+    var pageLink = findNexusPaginationPageLink(targetNexusPage);
+    if (pageLink) {
+      enhancer.allowNexusPaginationClick = true;
+      try {
+        pageLink.click();
+      } catch (errPageLink) {
+        enhancer.allowNexusPaginationClick = false;
+        return false;
+      }
+      setTimeout(function () {
+        enhancer.allowNexusPaginationClick = false;
+      }, 0);
+      return true;
+    }
+    if (direction === 1 || direction === -1) {
+      var btn = findNexusPaginationButton(direction);
+      if (btn) {
+        return navigateNexusResultsPageSoft(direction, { forceSoft: true });
+      }
+    }
+    return false;
+  }
+
+  function navigateFilteredBrowsePageByUrl(pageNum) {
+    if (!pageNum || pageNum < 1) {
+      return false;
+    }
+    try {
+      var url = buildNexusResultsPageUrl(pageNum);
+      enhancer.pendingPoolFetch = true;
+      saveCarouselPagingState();
+      window.location.replace(url);
+      return true;
+    } catch (errFilteredPageUrl) {
+      return false;
+    }
+  }
+
+  function navigateFilteredNexusResultsPage(targetNexusPage, config) {
+    if (!targetNexusPage || targetNexusPage < 1) {
+      return Promise.resolve(false);
+    }
+    var currentPage = getNexusResultsPageFromUrl();
+    if (currentPage === targetNexusPage &&
+        collectLiveGridCards(config || enhancer.config || {}).length >= 4) {
+      return Promise.resolve(true);
+    }
+    if (enhancer.filteredNexusPageNavInFlight) {
+      return Promise.resolve(false);
+    }
+    enhancer.filteredNexusPageNavInFlight = true;
+    enhancer.filteredNexusPageNavSince = Date.now();
+    enhancer.carouselPagingQuietUntil = Date.now() + 6000;
+
+    var direction = targetNexusPage - currentPage;
+    var startModIds = collectLiveModIdSet(config);
+    var navMode = 'none';
+
+    var navigated = withNexusPaginationUnhidden(function () {
+      if (!hasNumericNexusBrowseFilters() &&
+          clickFilteredNexusPaginationTarget(targetNexusPage, direction)) {
+        navMode = 'page-link';
+        return true;
+      }
+      if (direction === 1 || direction === -1) {
+        if (navigateNexusResultsPageSoft(direction, { forceSoft: true })) {
+          navMode = 'soft-button';
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (!navigated) {
+      if (hasNumericNexusBrowseFilters()) {
+        logToHost('navigateFilteredNexusResultsPage blocked hard navigation', {
+          targetNexusPage: targetNexusPage,
+        });
+      } else {
+        navigated = navigateFilteredBrowsePageByUrl(targetNexusPage);
+        if (navigated) {
+          navMode = 'url-replace';
+        }
+      }
+    }
+
+    if (!navigated) {
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+      logToHost('navigateFilteredNexusResultsPage failed', {
+        targetNexusPage: targetNexusPage,
+        currentPage: getNexusResultsPageFromUrl(),
+        direction: direction,
+      });
+      return Promise.resolve(false);
+    }
+
+    logToHost('navigateFilteredNexusResultsPage started', {
+      targetNexusPage: targetNexusPage,
+      currentPage: currentPage,
+      navMode: navMode,
+    });
+
+    function finishNav(ok) {
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+      if (ok) {
+        try {
+          sendToHost({
+            type: 'browse-navigate',
+            url: stripInternalBrowseParams(window.location.href),
+            syncOnly: true,
+          });
+        } catch (errSyncNav) {
+          // ignore
+        }
+      }
+      return ok;
+    }
+
+    return waitForFilteredNexusPageLoad(targetNexusPage, config, {
+      startModIds: startModIds,
+      timeoutMs: 18000,
+    }).then(finishNav);
+  }
+
+  function applyFilteredNexusDirectPage(config, options) {
+    options = options || {};
+    if (!config || !isFilteredBrowseSession(config)) {
+      return 0;
+    }
+    return safeApplyFilteredBrowseLiveOnlyPage(config, options);
+  }
+
+  function clearStaleCarouselAdvanceLocks() {
+    var now = Date.now();
+    if (enhancer.carouselAdvancePending &&
+        (!enhancer.carouselAdvancePendingSince ||
+         now - enhancer.carouselAdvancePendingSince > 3000)) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+    }
+    if (enhancer.filteredNexusPageNavSince &&
+        now - enhancer.filteredNexusPageNavSince > 25000) {
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+    }
+  }
+
+  function advanceFilteredCarouselPageHostFallback(targetNexusPage) {
+    var targetUrl = buildNexusResultsPageUrl(targetNexusPage);
+    logToHost('advanceFilteredCarouselPage host-fallback', {
+      targetNexusPage: targetNexusPage,
+      targetUrl: targetUrl,
+    });
+    enhancer.filteredNexusPageNavInFlight = true;
+    enhancer.filteredNexusPageNavSince = Date.now();
+    enhancer.carouselPagingQuietUntil = Date.now() + 10000;
+    try {
+      sendToHost({
+        type: 'browse-navigate',
+        url: stripInternalBrowseParams(targetUrl),
+        syncOnly: false,
+      });
+    } catch (errFilteredNavHost) {
+      // ignore
+    }
+    try {
+      window.location.replace(targetUrl);
+    } catch (errFilteredNavReplace) {
+      // ignore
+    }
+  }
+
+  function advanceFilteredCarouselPage(config, delta) {
+    logToHost('advanceFilteredCarouselPage begin', {
+      delta: delta,
+      urlPage: getNexusResultsPageFromUrl(),
+      inFlight: !!enhancer.filteredNexusPageNavInFlight,
+      pending: !!enhancer.carouselAdvancePending,
+    });
+    try {
+    if (!config || !isFilteredBrowseSession(config)) {
+      logToHost('advanceFilteredCarouselPage skipped', {
+        reason: 'not-filtered-session',
+        hasConfig: !!config,
+      });
+      return false;
+    }
+
+    var currentNexusPage = getNexusResultsPageFromUrl();
+    var targetNexusPage = currentNexusPage + delta;
+    if (targetNexusPage < 1) {
+      logToHost('advanceFilteredCarouselPage skipped', {
+        reason: 'before-first-page',
+        currentNexusPage: currentNexusPage,
+        targetNexusPage: targetNexusPage,
+      });
+      return false;
+    }
+
+    if (enhancer.filteredNexusPageNavInFlight || enhancer.carouselAdvancePending) {
+      logToHost('advanceFilteredCarouselPage blocked', {
+        reason: 'in-flight',
+        filteredNexusPageNavInFlight: !!enhancer.filteredNexusPageNavInFlight,
+        carouselAdvancePending: !!enhancer.carouselAdvancePending,
+      });
+      return false;
+    }
+
+    logToHost('advanceFilteredCarouselPage', {
+      delta: delta,
+      mode: 'pipeline',
+      currentNexusPage: currentNexusPage,
+      targetNexusPage: targetNexusPage,
+    });
+
+    if (targetNexusPage === currentNexusPage) {
+      applyFilteredBrowseLightPage(config);
+      scrollCarouselIntoView();
+      return true;
+    }
+
+    enhancer.carouselAdvancePending = true;
+    enhancer.carouselAdvancePendingSince = Date.now();
+    enhancer.carouselPagingQuietUntil = Date.now() + 10000;
+    enhancer.lastAppliedSliceKey = '';
+    resetFilteredCarouselCatalog();
+
+    navigateFilteredNexusResultsPage(targetNexusPage, config).then(function (navOk) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      if (navOk) {
+        applyFilteredBrowseLightPage(config);
+        scrollCarouselIntoView();
+        logToHost('advanceFilteredCarouselPage done', {
+          targetNexusPage: targetNexusPage,
+          urlPage: getNexusResultsPageFromUrl(),
+        });
+        return;
+      }
+      if (!hasNumericNexusBrowseFilters()) {
+        advanceFilteredCarouselPageHostFallback(targetNexusPage);
+      }
+    }).catch(function (errFilteredNavPipeline) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+      logErrorToHost('advanceFilteredCarouselPage pipeline error', {
+        error: String(errFilteredNavPipeline && errFilteredNavPipeline.message || errFilteredNavPipeline),
+        targetNexusPage: targetNexusPage,
+      });
+      if (!hasNumericNexusBrowseFilters()) {
+        advanceFilteredCarouselPageHostFallback(targetNexusPage);
+      }
+    });
+    return true;
+    } catch (errAdvanceFilteredSync) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      enhancer.filteredNexusPageNavInFlight = false;
+      enhancer.filteredNexusPageNavSince = 0;
+      logErrorToHost('advanceFilteredCarouselPage sync error', {
+        error: String(errAdvanceFilteredSync && errAdvanceFilteredSync.message || errAdvanceFilteredSync),
+        delta: delta,
+      });
+      return false;
+    }
+  }
+
+  function advanceNumericFilteredCarouselPage(config, delta) {
+    config = config || enhancer.config;
+    if (!config || !delta) {
+      return false;
+    }
+    logToHost('advanceNumericFilteredCarouselPage', {
+      delta: delta,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      clientSide: !!enhancer.clientSideNumericFilterActive,
+    });
+    traceStep('advance-numeric-filtered', {
+      delta: delta,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      clientSide: !!enhancer.clientSideNumericFilterActive,
+      catalog: (enhancer.filteredCarouselCatalog || []).length,
+    });
+    clearStaleCarouselAdvanceLocks();
+    var pageSize = getCarouselPageSize(config);
+    var catalog = getMinimalNumericBrowseCatalog(config);
+
+    if (delta < 0) {
+      if (enhancer.globalPageIndex <= 0) {
+        return false;
+      }
+      enhancer.globalPageIndex -= 1;
+      enhancer.batchPageIndex = enhancer.globalPageIndex;
+      enhancer.lastAppliedSliceKey = '';
+      saveCarouselPagingState();
+      enhancer.lastMinimalAppliedSliceKey = '';
+      enhancer.carouselPagingQuietUntil = Date.now() + 4000;
+      applyMinimalNumericFilteredPage(config, catalog, { forcePageApply: true });
+      scrollCarouselIntoView();
+      logToHost('advanceNumericFilteredCarouselPage local', {
+        page: enhancer.globalPageIndex + 1,
+        catalog: catalog.length,
+        clientSide: !!enhancer.clientSideNumericFilterActive,
+      });
+      traceStep('advance-numeric-filtered-local', {
+        page: enhancer.globalPageIndex + 1,
+        catalog: catalog.length,
+      });
+      return true;
+    }
+
+    if (enhancer.carouselAdvancePending) {
+      logToHost('advanceNumericFilteredCarouselPage blocked', { reason: 'pending' });
+      return false;
+    }
+
+    var targetIndex = enhancer.globalPageIndex + 1;
+    var needStart = targetIndex * pageSize;
+    if (needStart < catalog.length) {
+      enhancer.globalPageIndex = targetIndex;
+      enhancer.batchPageIndex = targetIndex;
+      enhancer.lastAppliedSliceKey = '';
+      enhancer.lastMinimalAppliedSliceKey = '';
+      enhancer.carouselPagingQuietUntil = Date.now() + 4000;
+      saveCarouselPagingState();
+      applyMinimalNumericFilteredPage(config, catalog, { forcePageApply: true });
+      scrollCarouselIntoView();
+      logToHost('advanceNumericFilteredCarouselPage local', {
+        page: targetIndex + 1,
+        catalog: catalog.length,
+        clientSide: !!enhancer.clientSideNumericFilterActive,
+      });
+      traceStep('advance-numeric-filtered-local', {
+        page: targetIndex + 1,
+        catalog: catalog.length,
+      });
+      return true;
+    }
+
+    var displayTotal = getLockedNexusFilteredDisplayTotal() || catalog.length;
+    var maxPageIndex = displayTotal > 0
+      ? Math.max(0, Math.ceil(displayTotal / pageSize) - 1)
+      : targetIndex;
+    if (targetIndex > maxPageIndex && !canFetchMoreCarouselBatches()) {
+      logToHost('advanceNumericFilteredCarouselPage blocked', {
+        reason: 'end-of-catalog',
+        page: targetIndex + 1,
+        displayTotal: displayTotal,
+      });
+      return false;
+    }
+
+    if (hasNumericNexusBrowseFilters() && !enhancer.clientSideNumericFilterActive) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      logToHost('advanceNumericFilteredCarouselPage blocked', {
+        reason: 'numeric-batch-source-unavailable',
+        page: targetIndex + 1,
+        catalog: catalog.length,
+      });
+      return false;
+    }
+
+    enhancer.carouselAdvancePending = true;
+    enhancer.carouselAdvancePendingSince = Date.now();
+    logToHost('advanceNumericFilteredCarouselPage fetch', {
+      targetPage: targetIndex + 1,
+      catalog: catalog.length,
+      needStart: needStart,
+    });
+    fetchMoreFilteredCarouselMods(config, targetIndex).then(function (ok) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      var refreshed = getMinimalNumericBrowseCatalog(config);
+      if (ok || (targetIndex * pageSize) < refreshed.length) {
+        enhancer.globalPageIndex = targetIndex;
+        enhancer.batchPageIndex = targetIndex;
+        enhancer.lastAppliedSliceKey = '';
+        saveCarouselPagingState();
+        enhancer.lastMinimalAppliedSliceKey = '';
+        enhancer.carouselPagingQuietUntil = Date.now() + 4000;
+        applyMinimalNumericFilteredPage(config, refreshed, { forcePageApply: true });
+        scrollCarouselIntoView();
+        logToHost('advanceNumericFilteredCarouselPage fetch done', {
+          page: targetIndex + 1,
+          catalog: refreshed.length,
+          ok: !!ok,
+        });
+        return;
+      }
+      logToHost('advanceNumericFilteredCarouselPage fetch failed', {
+        page: targetIndex + 1,
+        catalog: refreshed.length,
+      });
+    }).catch(function (errNumericAdvanceFetch) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      logErrorToHost('advanceNumericFilteredCarouselPage fetch error', {
+        error: String(errNumericAdvanceFetch && errNumericAdvanceFetch.message || errNumericAdvanceFetch),
+      });
+    });
+    return true;
+  }
+
+  function advanceFilteredLiveCarouselPage(config, delta) {
+    config = config || enhancer.config;
+    if (!config) {
+      return false;
+    }
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return advanceNumericFilteredCarouselPage(config, delta);
+    }
+    logToHost('advanceFilteredLiveCarouselPage begin', {
+      delta: delta,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      catalog: enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0,
+      numeric: !!shouldUseNumericFilteredBrowseScan(config),
+    });
+    ensureFilteredCarouselCatalogFromLive(config);
+    var liveTileCount = collectLiveGridCards(config).length;
+    logToHost('advanceFilteredLiveCarouselPage primed', {
+      delta: delta,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      catalog: enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0,
+      liveTiles: liveTileCount,
+    });
+    try {
+    if (!config || !isFilteredBrowseSession(config)) {
+      logToHost('advanceFilteredLiveCarouselPage skipped', { reason: 'not-filtered-session' });
+      return false;
+    }
+    clearStaleCarouselAdvanceLocks();
+    clearStaleFilteredBrowseFetchLocks();
+    enhancer.carouselPagingQuietUntil = Date.now() + 1200;
+    var pageSize = getCarouselPageSize(config);
+
+    if (delta < 0) {
+      if (enhancer.globalPageIndex <= 0) {
+        return false;
+      }
+      enhancer.globalPageIndex -= 1;
+      enhancer.batchPageIndex = enhancer.globalPageIndex;
+      enhancer.lastAppliedSliceKey = '';
+      saveCarouselPagingState();
+      if (hasNumericNexusBrowseFilters()) {
+        applyNumericFilteredLivePage(config, { forcePageApply: true });
+      } else {
+        safeApplyFilteredBrowseLiveOnlyPage(config, { forcePageApply: true, skipHeadlineSync: true });
+      }
+      scrollCarouselIntoView();
+      logToHost('advanceFilteredLiveCarouselPage back', {
+        page: enhancer.globalPageIndex + 1,
+      });
+      return true;
+    }
+
+    if (enhancer.carouselAdvancePending) {
+      logToHost('advanceFilteredLiveCarouselPage blocked', { reason: 'pending' });
+      return false;
+    }
+
+    var visible = getFilteredCarouselVisibleEntries(config);
+    var nextPageStart = (enhancer.globalPageIndex + 1) * pageSize;
+    var nextPageEnd = nextPageStart + pageSize;
+    var knownFilteredTotal = getLockedNexusFilteredDisplayTotal() ||
+      getEffectiveResultsTotal(config, visible.length);
+    var nextPageIsComplete = visible.length >= nextPageEnd ||
+      (knownFilteredTotal > 0 && visible.length >= knownFilteredTotal);
+    if (nextPageStart < visible.length && nextPageIsComplete) {
+      enhancer.globalPageIndex += 1;
+      enhancer.batchPageIndex = enhancer.globalPageIndex;
+      enhancer.lastAppliedSliceKey = '';
+      saveCarouselPagingState();
+      if (hasNumericNexusBrowseFilters()) {
+        applyNumericFilteredLivePage(config, { forcePageApply: true });
+      } else {
+        safeApplyFilteredBrowseLiveOnlyPage(config, { forcePageApply: true, skipHeadlineSync: true });
+      }
+      scrollCarouselIntoView();
+      logToHost('advanceFilteredLiveCarouselPage local', {
+        page: enhancer.globalPageIndex + 1,
+        visible: visible.length,
+        liveTiles: liveTileCount,
+      });
+      return true;
+    }
+
+    if (liveTileCount > nextPageStart) {
+      ensureFilteredCarouselCatalogFromLive(config);
+      visible = getFilteredCarouselVisibleEntries(config);
+      nextPageIsComplete = visible.length >= nextPageEnd ||
+        (knownFilteredTotal > 0 && visible.length >= knownFilteredTotal);
+      if (nextPageStart < visible.length && nextPageIsComplete) {
+        enhancer.globalPageIndex += 1;
+        enhancer.batchPageIndex = enhancer.globalPageIndex;
+        enhancer.lastAppliedSliceKey = '';
+        saveCarouselPagingState();
+        if (hasNumericNexusBrowseFilters()) {
+          applyNumericFilteredLivePage(config, { forcePageApply: true });
+        } else {
+          safeApplyFilteredBrowseLiveOnlyPage(config, { forcePageApply: true, skipHeadlineSync: true });
+        }
+        scrollCarouselIntoView();
+        logToHost('advanceFilteredLiveCarouselPage local-resync', {
+          page: enhancer.globalPageIndex + 1,
+          visible: visible.length,
+          liveTiles: liveTileCount,
+        });
+        return true;
+      }
+    }
+
+    var catalogTotal = hasNumericNexusBrowseFilters()
+      ? (getLockedNexusFilteredDisplayTotal() || visible.length)
+      : getEffectiveResultsTotal(config, visible.length);
+    var maxPageIndex = catalogTotal > 0
+      ? Math.max(0, Math.ceil(catalogTotal / pageSize) - 1)
+      : enhancer.globalPageIndex;
+    if (enhancer.globalPageIndex >= maxPageIndex && !canFetchMoreCarouselBatches()) {
+      logToHost('advanceFilteredLiveCarouselPage blocked', {
+        reason: 'end-of-catalog',
+        page: enhancer.globalPageIndex + 1,
+        catalogTotal: catalogTotal,
+      });
+      return false;
+    }
+
+    var targetPage = enhancer.globalPageIndex + 1;
+    enhancer.carouselAdvancePending = true;
+    enhancer.carouselAdvancePendingSince = Date.now();
+    logToHost('advanceFilteredLiveCarouselPage fetch', {
+      targetPage: targetPage + 1,
+      visible: visible.length,
+      needStart: nextPageStart,
+    });
+    fetchMoreFilteredCarouselMods(config, targetPage).then(function (ok) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      var refreshedVisible = getFilteredCarouselVisibleEntries(config);
+      var refreshedStart = targetPage * pageSize;
+      var refreshedEnd = refreshedStart + pageSize;
+      var refreshedComplete = refreshedVisible.length >= refreshedEnd ||
+        (knownFilteredTotal > 0 && refreshedVisible.length >= knownFilteredTotal);
+      if (refreshedComplete) {
+        enhancer.globalPageIndex = targetPage;
+        enhancer.batchPageIndex = targetPage;
+        enhancer.lastAppliedSliceKey = '';
+        saveCarouselPagingState();
+        if (hasNumericNexusBrowseFilters()) {
+          applyNumericFilteredLivePage(config, { forcePageApply: true });
+        } else {
+          safeApplyFilteredBrowseLiveOnlyPage(config, { forcePageApply: true, skipHeadlineSync: true });
+        }
+        scrollCarouselIntoView();
+        logToHost('advanceFilteredLiveCarouselPage fetch done', {
+          page: targetPage + 1,
+          visible: refreshedVisible.length,
+          ok: !!ok,
+        });
+        return;
+      }
+      logToHost('advanceFilteredLiveCarouselPage fetch failed', {
+        targetPage: targetPage + 1,
+        visible: refreshedVisible.length,
+      });
+    }).catch(function (errFilteredLiveAdvance) {
+      enhancer.carouselAdvancePending = false;
+      enhancer.carouselAdvancePendingSince = 0;
+      logErrorToHost('advanceFilteredLiveCarouselPage fetch error', {
+        error: String(errFilteredLiveAdvance && errFilteredLiveAdvance.message || errFilteredLiveAdvance),
+      });
+    });
+    return true;
+    } catch (errAdvanceFilteredLive) {
+      logErrorToHost('advanceFilteredLiveCarouselPage error', {
+        error: String(errAdvanceFilteredLive && errAdvanceFilteredLive.message || errAdvanceFilteredLive),
+        stack: String(errAdvanceFilteredLive && errAdvanceFilteredLive.stack || ''),
+        delta: delta,
+      });
+      return false;
+    }
+  }
+
   function advanceCarouselPage(delta) {
     var config = enhancer.config;
+    // Numeric browse controls use advanceNumericFilteredCarouselPage
+    // directly. Older document-level listeners can survive reinjection, so
+    // never let this general path process numeric clicks a second time.
+    if (config && shouldUseNumericFilteredBrowseScan(config)) {
+      return false;
+    }
+    clearStaleCarouselAdvanceLocks();
+    enhancer.carouselAdvancePending = false;
+    enhancer.carouselAdvancePendingSince = 0;
+    var numericBrowse = shouldUseNumericFilteredBrowseScan(config);
+    traceStep('advance-carousel-page', {
+      delta: delta,
+      numeric: !!numericBrowse,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      catalog: enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0,
+      clientSide: !!enhancer.clientSideNumericFilterActive,
+    });
+    var domFiltered = !!enhancer.domFilterBrowseActive;
+    var filteredSession = !!(config && isFilteredBrowseSession(config));
+    logToHost('advanceCarouselPage', {
+      delta: delta,
+      filtered: filteredSession,
+      numeric: !!numericBrowse,
+      domFiltered: !!domFiltered,
+      engaged: !!enhancer.filteredBrowseEngaged,
+      liveOnly: !!(filteredSession && filteredBrowseUsesLiveCatalogOnly()),
+      hasConfig: !!config,
+      carouselAdvancePending: !!enhancer.carouselAdvancePending,
+      filteredNexusPageNavInFlight: !!enhancer.filteredNexusPageNavInFlight,
+      urlPage: getNexusResultsPageFromUrl(),
+      domPage: getNexusResultsPageFromDom(),
+      catalog: enhancer.filteredCarouselCatalog ? enhancer.filteredCarouselCatalog.length : 0,
+      page: (enhancer.globalPageIndex || 0) + 1,
+      clientSide: !!enhancer.clientSideNumericFilterActive,
+    });
+    if (config && numericBrowse) {
+      try {
+        clearFilteredBrowseLocksForPaging();
+      } catch (errClearNumericLocks) {
+        logErrorToHost('clearFilteredBrowseLocksForPaging failed', {
+          error: String(errClearNumericLocks && errClearNumericLocks.message || errClearNumericLocks),
+        });
+      }
+      try {
+        advanceNumericFilteredCarouselPage(config, delta);
+      } catch (errAdvanceNumericRoute) {
+        logErrorToHost('advanceNumericFilteredCarouselPage route error', {
+          error: String(errAdvanceNumericRoute && errAdvanceNumericRoute.message || errAdvanceNumericRoute),
+        });
+      }
+      return;
+    }
+    if (config && filteredSession) {
+      try {
+        clearFilteredBrowseLocksForPaging();
+      } catch (errClearFilteredLocks) {
+        logErrorToHost('clearFilteredBrowseLocksForPaging failed', {
+          error: String(errClearFilteredLocks && errClearFilteredLocks.message || errClearFilteredLocks),
+        });
+      }
+      try {
+        advanceFilteredLiveCarouselPage(config, delta);
+      } catch (errAdvanceFilteredRoute) {
+        logErrorToHost('advanceFilteredLiveCarouselPage route error', {
+          error: String(errAdvanceFilteredRoute && errAdvanceFilteredRoute.message || errAdvanceFilteredRoute),
+        });
+      }
+      return;
+    }
+    if (urlHasActiveNexusFilters()) {
+      try {
+        clearFilteredBrowseLocksForPaging();
+      } catch (errClearFilteredLocksGeneric) {
+        logErrorToHost('clearFilteredBrowseLocksForPaging failed', {
+          error: String(errClearFilteredLocksGeneric && errClearFilteredLocksGeneric.message || errClearFilteredLocksGeneric),
+        });
+      }
+    }
+
     if (delta > 0) {
       if (config && isLocalCatalogMode(config) && enhancer.trackedCatalogActive) {
         if (enhancer.localCatalogNavLock) {
           return;
         }
-      } else if (enhancer.carouselAdvancePending || enhancer.fetchInFlightPage ||
-          enhancer.nativeNavFetchInFlight || enhancer.pendingNativeCatalogFetch) {
+      } else if (enhancer.carouselAdvancePending) {
         return;
+      } else if (enhancer.fetchInFlightPage || enhancer.nativeNavFetchInFlight ||
+          enhancer.pendingNativeCatalogFetch) {
+        if (!enhancer.filteredBrowseHostBatchInFlight ||
+            enhancer.filteredBrowseHostBatchPhase === 'forward') {
+          return;
+        }
       }
     } else if (config && isLocalCatalogMode(config) && enhancer.trackedCatalogActive &&
         enhancer.localCatalogNavLock) {
@@ -6345,8 +14186,11 @@
         return;
       }
       var backCards = collectCards(config);
-      applyLiveCarouselPage(backCards, config);
-      decorateVisibleCarouselSlice(backCards, config);
+      if (urlHasActiveNexusFilters()) {
+        applyFilteredBrowseCarouselPage(config, backCards);
+      } else {
+        applyLiveCarouselPage(backCards, config);
+      }
       scrollCarouselIntoView();
       return;
     }
@@ -6402,9 +14246,23 @@
     var cards = collectCards(config);
     applyFilters(cards, config);
     var visible = getVisibleCarouselCards(cards);
+    var visibleCount = visible.length;
+    var maxLoadedPageIndex = getMaxFullCarouselPageIndex(pageSize, visibleCount);
+    if (delta > 0 && enhancer.globalPageIndex > maxLoadedPageIndex &&
+        !canFetchMoreCarouselBatches()) {
+      return;
+    }
+    var targetPage = enhancer.globalPageIndex + 1;
+    var hasNextPageLoaded = carouselPageFullyLoaded(targetPage, visibleCount, pageSize);
 
-    var nextPageStart = (enhancer.globalPageIndex + 1) * pageSize;
-    var hasNextPageLoaded = nextPageStart < visible.length;
+    if (!hasNextPageLoaded && isPooledNexusCarouselBrowseMode(config)) {
+      maybePrefetchDismissedLiveBatch(config);
+      cards = collectCards(config);
+      applyFilters(cards, config);
+      visible = getVisibleCarouselCards(cards);
+      visibleCount = visible.length;
+      hasNextPageLoaded = carouselPageFullyLoaded(targetPage, visibleCount, pageSize);
+    }
 
     if (hasNextPageLoaded) {
       enhancer.globalPageIndex += 1;
@@ -6419,18 +14277,33 @@
       enhancer.carouselAdvancePending = true;
       enhancer.pendingTargetPage = enhancer.globalPageIndex + 1;
       saveCarouselPagingState();
-      beginNexusBatchFetch(config).then(function (ok) {
+      var pooledAdvance = isPooledNexusCarouselBrowseMode(config);
+      beginNexusBatchFetch(config, {
+        allowNavigation: urlHasActiveNexusFilters() ? 'soft' : false,
+      }).then(function (ok) {
+        return ok;
+      }).then(function (ok) {
         enhancer.carouselAdvancePending = false;
         if (!ok) {
           enhancer.pendingTargetPage = null;
           return;
         }
+        if (pooledAdvance) {
+          if (isDismissedCarouselBrowseMode(config)) {
+            saveDismissedBrowsePoolSnapshot(config);
+          } else {
+            saveNativePoolSnapshot(config);
+          }
+        }
         enhancer.globalPageIndex += 1;
         enhancer.pendingTargetPage = null;
         saveCarouselPagingState();
         var refreshed = collectCards(config);
-        applyLiveCarouselPage(refreshed, config);
-        decorateVisibleCarouselSlice(refreshed, config);
+        if (urlHasActiveNexusFilters()) {
+          applyFilteredBrowseCarouselPage(config, refreshed);
+        } else {
+          applyLiveCarouselPage(refreshed, config);
+        }
         ensureCarouselControlsBar();
         protectBrowseControlsFromChromeHide();
         scheduleControlsRemount();
@@ -6441,8 +14314,11 @@
 
     enhancer.pendingTargetPage = null;
     var refreshed = collectCards(config);
-    applyLiveCarouselPage(refreshed, config);
-    decorateVisibleCarouselSlice(refreshed, config);
+    if (urlHasActiveNexusFilters()) {
+      applyFilteredBrowseCarouselPage(config, refreshed);
+    } else {
+      applyLiveCarouselPage(refreshed, config);
+    }
     scrollCarouselIntoView();
   }
 
@@ -6567,7 +14443,1064 @@
   }
 
   function normalizeUiText(value) {
-    return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    var sample = String(value || '');
+    if (sample.length > 2048) {
+      sample = sample.slice(0, 2048);
+    }
+    var normalized = sample.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (normalized.length > 512) {
+      return normalized.slice(0, 512);
+    }
+    return normalized;
+  }
+
+  function rowLooksLikeNexusActiveFilters(node) {
+    if (!node || !node.querySelector) {
+      return false;
+    }
+    var text = normalizeUiText(node.textContent);
+    if (text.indexOf('clear all') < 0) {
+      return false;
+    }
+    if (/\b[\d][\d,]* results\b/i.test(text)) {
+      return false;
+    }
+    if (rowHasSortControls(node)) {
+      return false;
+    }
+    if (browseUrlHasRemovableActiveFilters()) {
+      return rowHasVisibleActiveFilterChips(node);
+    }
+    return false;
+  }
+
+  function isInMainBrowseColumn(node, options) {
+    if (!node) {
+      return false;
+    }
+    if (node.closest('aside, #filters-panel, [data-vortex-enhanced-filters="true"]')) {
+      return false;
+    }
+    var aside = findNexusFilterAside();
+    if (aside && aside.contains(node)) {
+      return false;
+    }
+    var ignoreVisibility = !!(options && options.ignoreVisibility);
+    var rect = node.getBoundingClientRect();
+    if (!ignoreVisibility && !rect.width && !rect.height) {
+      return false;
+    }
+    if (aside && !ignoreVisibility) {
+      var asideRect = aside.getBoundingClientRect();
+      if (rect.left < asideRect.right - 24) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function looksLikeActiveFilterChip(node) {
+    if (!node) {
+      return false;
+    }
+    if (node.closest('label, [role="checkbox"], input, aside, #filters-panel')) {
+      return false;
+    }
+    var aria = normalizeUiText(node.getAttribute && node.getAttribute('aria-label'));
+    if (aria.indexOf('clear all') >= 0) {
+      return false;
+    }
+    if (aria.indexOf('translation') >= 0 &&
+        (aria.indexOf('excluded') >= 0 || aria.indexOf('exclude') >= 0 || aria.indexOf('remove') >= 0)) {
+      return true;
+    }
+    if (!node.textContent) {
+      return false;
+    }
+    var text = normalizeUiText(node.textContent);
+    if (text.indexOf('clear all') >= 0) {
+      return false;
+    }
+    if (text.indexOf('excluded:') >= 0 && text.length < 64) {
+      return true;
+    }
+    if (text.length < 64 &&
+        (text.indexOf('max downloads') >= 0 ||
+         text.indexOf('min downloads') >= 0 ||
+         text.indexOf('max endorsements') >= 0 ||
+         text.indexOf('min endorsements') >= 0)) {
+      return !!node.closest('button, a, [role="button"]');
+    }
+    if (text.length < 64 &&
+        text.indexOf('translation') >= 0 &&
+        (text.indexOf('excluded') >= 0 || text.indexOf('exclude') >= 0)) {
+      return true;
+    }
+    if ((text.indexOf('hide adult') >= 0 ||
+        text.indexOf('hide installed') >= 0 ||
+        text.indexOf('only installed') >= 0 ||
+        text.indexOf('hide tracked') >= 0 ||
+        text.indexOf('only tracked') >= 0) &&
+        text.length < 48) {
+      return !!node.closest('button, a, [role="button"]');
+    }
+    return false;
+  }
+
+  function isClearAllControl(node) {
+    if (!node || !node.textContent) {
+      return false;
+    }
+    if (!isInMainBrowseColumn(node, { ignoreVisibility: browseUrlHasRemovableActiveFilters() })) {
+      return false;
+    }
+    var label = normalizeUiText(node.textContent);
+    return label === 'clear all';
+  }
+
+  function findNexusClearAllControl(nearRow) {
+    if (nearRow) {
+      var local = nearRow.querySelectorAll('button, a, [role="button"], span');
+      for (var i = 0; i < local.length; i++) {
+        if (isClearAllControl(local[i])) {
+          return local[i];
+        }
+      }
+    }
+    var nodes = document.querySelectorAll('button, a, [role="button"], span');
+    for (var j = 0; j < nodes.length; j++) {
+      if (isClearAllControl(nodes[j])) {
+        return nodes[j];
+      }
+    }
+    return null;
+  }
+
+  function findNexusActiveFilterChip() {
+    var selectors = [
+      '[class*="ActiveFilter"] button',
+      '[class*="ActiveFilter"] a',
+      '[class*="AppliedFilter"] button',
+      '[class*="AppliedFilter"] a',
+      'button',
+      'a',
+      '[role="button"]',
+      'span',
+      'div',
+    ];
+    for (var s = 0; s < selectors.length; s++) {
+      var nodes = document.querySelectorAll(selectors[s]);
+      for (var i = 0; i < nodes.length; i++) {
+        var node = nodes[i];
+        if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+          continue;
+        }
+        if (!looksLikeActiveFilterChip(node)) {
+          continue;
+        }
+        return node.closest('button, a, [role="button"]') || node;
+      }
+    }
+    return null;
+  }
+
+  function findTranslationFilterChipAnywhere() {
+    if (!translationFilterExcludedInUrl()) {
+      return null;
+    }
+    var chip = findNexusActiveFilterChip();
+    if (chip) {
+      return chip;
+    }
+    var nodes = document.querySelectorAll('[class*="ActiveFilter"], [class*="AppliedFilter"], button, a, [role="button"]');
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+        continue;
+      }
+      var text = normalizeUiText(node.textContent);
+      var aria = normalizeUiText(node.getAttribute && node.getAttribute('aria-label'));
+      if ((text.indexOf('translation') >= 0 || aria.indexOf('translation') >= 0) &&
+          (text.indexOf('exclud') >= 0 || aria.indexOf('exclud') >= 0)) {
+        return node.closest('button, a, [role="button"]') || node;
+      }
+    }
+    return null;
+  }
+
+  function findActiveFiltersRowFromChip(chip) {
+    if (!chip) {
+      return null;
+    }
+    var clearEl = findNexusClearAllControl(chip.parentElement) || findNexusClearAllControl(null);
+    var row = chip.parentElement;
+    if (clearEl && row && row.contains(clearEl)) {
+      return row;
+    }
+    if (clearEl && clearEl.parentElement && clearEl.parentElement.contains(chip)) {
+      return clearEl.parentElement;
+    }
+    return row;
+  }
+
+  function rowHasVisibleActiveFilterChips(row) {
+    if (!row || !row.querySelectorAll) {
+      return false;
+    }
+    var chips = row.querySelectorAll('button, a, [role="button"]');
+    for (var i = 0; i < chips.length; i++) {
+      var chip = chips[i];
+      if (isClearAllControl(chip)) {
+        continue;
+      }
+      if (looksLikeActiveFilterChip(chip)) {
+        return true;
+      }
+      var text = normalizeUiText(chip.textContent);
+      if (text.indexOf('excluded:') >= 0 ||
+          text.indexOf('hide adult') >= 0 ||
+          text.indexOf('hide installed') >= 0 ||
+          text.indexOf('only installed') >= 0 ||
+          text.indexOf('hide tracked') >= 0 ||
+          text.indexOf('only tracked') >= 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function browseUrlHasRemovableActiveFilters() {
+    if (translationFilterExcludedInUrl()) {
+      return true;
+    }
+    return urlHasActiveNexusFilters();
+  }
+
+  function shouldPreserveActiveFilterRow(row) {
+    if (!row) {
+      return false;
+    }
+    if (rowHasVisibleActiveFilterChips(row)) {
+      return true;
+    }
+    if (browseUrlHasRemovableActiveFilters() && findNexusClearAllControl(row)) {
+      return true;
+    }
+    return false;
+  }
+
+  function findExcludedTranslationChipInRow(row) {
+    if (!row || !row.querySelectorAll) {
+      return null;
+    }
+    var nodes = row.querySelectorAll('button, a, [role="button"], span, div, p');
+    for (var i = 0; i < nodes.length; i++) {
+      var text = normalizeUiText(nodes[i].textContent);
+      if (text.indexOf('excluded:') >= 0 && text.indexOf('translation') >= 0) {
+        return nodes[i].closest('button, a, [role="button"]') || nodes[i];
+      }
+    }
+    return null;
+  }
+
+  function ensureActiveFilterRowVisible(row) {
+    if (!row) {
+      return;
+    }
+    row.classList.remove(
+      'vortex-enhanced-chrome-hidden',
+      'vortex-enhanced-browse-trim-hidden',
+      'vortex-enhanced-nexus-active-filters-empty',
+      'vortex-enhanced-browse-gap-collapse'
+    );
+    unhideBrowseContentChain(row);
+    row.querySelectorAll('button, a, [role="button"], span, div, p').forEach(function (node) {
+      if (isClearAllControl(node) || looksLikeActiveFilterChip(node)) {
+        node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-browse-gap-collapse');
+      }
+      var text = normalizeUiText(node.textContent);
+      if (text.indexOf('excluded:') >= 0 || text.indexOf('translation') >= 0) {
+        node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-browse-gap-collapse');
+      }
+    });
+  }
+
+  function findNexusActiveFilterRow() {
+    var chip = findTranslationFilterChipAnywhere() || findNexusActiveFilterChip();
+    if (chip) {
+      ensureActiveFilterRowVisible(chip.closest('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]') || chip.parentElement);
+      var chipRow = findActiveFiltersRowFromChip(chip);
+      if (chipRow && isInMainBrowseColumn(chipRow, { ignoreVisibility: true })) {
+        return chipRow;
+      }
+    }
+
+    if (!browseUrlHasRemovableActiveFilters()) {
+      return null;
+    }
+
+    var clearEl = findNexusClearAllControl(null);
+    if (!clearEl || !isInMainBrowseColumn(clearEl)) {
+      return null;
+    }
+
+    var row = clearEl.parentElement;
+    for (var depth = 0; depth < 6 && row; depth++) {
+      if (!isInMainBrowseColumn(row)) {
+        break;
+      }
+      if (rowHasSortControls(row) || rowLooksLikeResultsHeader(row)) {
+        break;
+      }
+      if (findNexusClearAllControl(row)) {
+        return row;
+      }
+      row = row.parentElement;
+    }
+
+    return clearEl.parentElement;
+  }
+
+  function nodeIsProtectedFromGapCollapse(node) {
+    if (!node) {
+      return true;
+    }
+    if (node.classList && node.classList.contains('vortex-enhanced-carousel-host')) {
+      return true;
+    }
+    if (node.closest('.vortex-enhanced-carousel-host')) {
+      return true;
+    }
+    if (node.querySelector('.vortex-enhanced-carousel-host, .vortex-enhanced-grid-layout, [data-e2eid="mod-tile"]')) {
+      return true;
+    }
+    if (rowHasSortControls(node)) {
+      return true;
+    }
+    if (toolbarChildShouldStayVisible(node)) {
+      return true;
+    }
+    if (node.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row, .vortex-enhanced-results-toolbar')) {
+      return true;
+    }
+    return false;
+  }
+
+  function restoreNumericBrowseVisibilityLight() {
+    var shellSelectors = [
+      '.vortex-enhanced-carousel-host',
+      '.vortex-enhanced-grid-layout',
+      '.vortex-enhanced-nexus-grid',
+      '.vortex-enhanced-unified-toolbar-row',
+      '.vortex-enhanced-sort-toolbar-row',
+      '.vortex-enhanced-results-toolbar',
+      '#vortex-enhanced-carousel-controls',
+      '#vortex-enhanced-controls-bar',
+      '#vortex-enhanced-controls-anchor',
+      '[data-vortex-enhanced-ui="true"]',
+    ];
+    shellSelectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        node.classList.remove(
+          'vortex-enhanced-browse-gap-collapse',
+          'vortex-enhanced-nexus-active-filters-empty',
+          'vortex-enhanced-chrome-hidden',
+          'vortex-enhanced-browse-trim-hidden'
+        );
+        unhideBrowseContentChain(node);
+      });
+    });
+    var grid = resolveNexusModGridElement() || findModGrid();
+    if (grid) {
+      unhideBrowseContentChain(grid);
+      var host = grid.parentElement;
+      if (host) {
+        host.classList.add('vortex-enhanced-carousel-host');
+        host.classList.remove('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-chrome-hidden');
+        unhideBrowseContentChain(host);
+      }
+    }
+  }
+
+  function restoreMainBrowseContentVisibility() {
+    if (shouldUseNumericFilteredBrowseScan()) {
+      restoreNumericBrowseVisibilityLight();
+      return;
+    }
+    var selectors = [
+      '.vortex-enhanced-carousel-host',
+      '.vortex-enhanced-grid-layout',
+      '.vortex-enhanced-nexus-grid',
+      '.vortex-enhanced-unified-toolbar-row',
+      '.vortex-enhanced-sort-toolbar-row',
+      '.vortex-enhanced-results-toolbar',
+      '#vortex-enhanced-carousel-controls',
+      '#vortex-enhanced-controls-bar',
+      '#vortex-enhanced-controls-anchor',
+      '[data-vortex-enhanced-ui="true"]',
+      '[data-e2eid="mod-tile"]',
+    ];
+    selectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        node.classList.remove(
+          'vortex-enhanced-browse-gap-collapse',
+          'vortex-enhanced-nexus-active-filters-empty',
+          'vortex-enhanced-chrome-hidden',
+          'vortex-enhanced-browse-trim-hidden'
+        );
+        if (node.style) {
+          node.style.removeProperty('height');
+          node.style.removeProperty('min-height');
+          node.style.removeProperty('margin');
+          node.style.removeProperty('padding');
+        }
+        unhideBrowseContentChain(node);
+      });
+    });
+
+    var grid = findModGrid();
+    if (grid) {
+      unhideBrowseContentChain(grid);
+      var host = grid.parentElement;
+      if (host) {
+        host.classList.remove('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-chrome-hidden');
+        unhideBrowseContentChain(host);
+      }
+    }
+  }
+
+  function clearBrowseLayoutCollapseMarks() {
+    restoreMainBrowseContentVisibility();
+
+    document.querySelectorAll('.vortex-enhanced-browse-gap-collapse, .vortex-enhanced-nexus-active-filters-empty').forEach(function (node) {
+      if (nodeIsProtectedFromGapCollapse(node)) {
+        node.classList.remove('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-nexus-active-filters-empty');
+      }
+    });
+  }
+
+  function nodeIsStrictDismissedFilterRow(node) {
+    if (!node || !isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+      return false;
+    }
+    if (nodeIsProtectedFromGapCollapse(node)) {
+      return false;
+    }
+    if (rowHasVisibleActiveFilterChips(node)) {
+      return false;
+    }
+    if (rowHasSortControls(node)) {
+      return false;
+    }
+    if (node.querySelector('[data-e2eid="mod-tile"], .vortex-enhanced-carousel-host, .vortex-enhanced-grid-layout')) {
+      return false;
+    }
+    var text = normalizeUiText(node.textContent);
+    if (/\b[\d][\d,]*\s+(?:results|matching)\b/i.test(text)) {
+      return false;
+    }
+    if (text.indexOf('date published') >= 0 || text.indexOf('prev') >= 0 || text.indexOf('next') >= 0) {
+      return false;
+    }
+    if (node.classList.contains('vortex-enhanced-nexus-active-filters')) {
+      return true;
+    }
+    var className = String(node.className || '');
+    if (className.indexOf('ActiveFilter') < 0 && className.indexOf('AppliedFilter') < 0) {
+      return false;
+    }
+    return text.indexOf('clear all') >= 0 ||
+      text.indexOf('excluded') >= 0 ||
+      text.indexOf('translation') >= 0;
+  }
+
+  function collapseDismissedFilterNode(node) {
+    if (!node || nodeIsProtectedFromGapCollapse(node)) {
+      return;
+    }
+    if (rowHasSortControls(node) || node.querySelector('[data-e2eid="mod-tile"], .vortex-enhanced-carousel-host')) {
+      return;
+    }
+    node.classList.remove(
+      'vortex-enhanced-nexus-active-filters',
+      'vortex-enhanced-nexus-active-filters-shell',
+      'vortex-enhanced-nexus-active-filters-host',
+      'vortex-enhanced-nexus-browse-header-compact',
+      'vortex-enhanced-has-active-filters',
+      'vortex-enhanced-chrome-hidden'
+    );
+    node.classList.add('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-nexus-active-filters-empty');
+  }
+
+  function syncBrowseUrlFilterDocumentState() {
+    var root = document.documentElement;
+    if (!root) {
+      return;
+    }
+    if (browseUrlHasRemovableActiveFilters()) {
+      root.classList.remove('vortex-enhanced-no-url-filters');
+      return;
+    }
+    root.classList.add('vortex-enhanced-no-url-filters');
+  }
+
+  function nodeLooksLikeEmptyFilterSlot(node) {
+    if (!node || nodeIsProtectedFromGapCollapse(node)) {
+      return false;
+    }
+    if (rowHasVisibleActiveFilterChips(node) || rowHasSortControls(node)) {
+      return false;
+    }
+    if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+      return false;
+    }
+    if (node.closest('.vortex-enhanced-carousel-host, aside, #filters-panel, [data-vortex-enhanced-filters="true"]')) {
+      return false;
+    }
+    if (node.querySelector('.vortex-enhanced-carousel-host, .vortex-enhanced-unified-toolbar-row, .vortex-enhanced-sort-toolbar-row, [data-e2eid="mod-tile"]')) {
+      return false;
+    }
+    if (node.classList && node.classList.contains('vortex-enhanced-nexus-active-filters-empty')) {
+      return true;
+    }
+    var className = String(node.className || '');
+    if (className.indexOf('ActiveFilter') >= 0 || className.indexOf('AppliedFilter') >= 0) {
+      return nodeIsStrictDismissedFilterRow(node);
+    }
+    if (node.classList && node.classList.contains('vortex-enhanced-nexus-active-filters')) {
+      return nodeIsStrictDismissedFilterRow(node);
+    }
+    return false;
+  }
+
+  function collapseFilterGapBetweenToolbarAndGrid() {
+    syncBrowseUrlFilterDocumentState();
+    if (browseUrlHasRemovableActiveFilters() ||
+        shouldDeferDismissLayoutCollapse()) {
+      return;
+    }
+
+    restoreMainBrowseContentVisibility();
+
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    var toolbar = findResultsToolbarRow();
+    if (!host) {
+      return;
+    }
+
+    if (toolbar) {
+      toolbar.classList.remove('vortex-enhanced-has-active-filters');
+      if (toolbar.style) {
+        toolbar.style.removeProperty('padding-bottom');
+        toolbar.style.removeProperty('margin-bottom');
+        toolbar.style.removeProperty('min-height');
+        toolbar.style.removeProperty('row-gap');
+      }
+      collapseEmptyToolbarChildren(toolbar);
+    }
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters, [class*="ActiveFilter"], [class*="AppliedFilter"]').forEach(function (node) {
+      if (nodeIsStrictDismissedFilterRow(node)) {
+        collapseDismissedFilterNode(node);
+      }
+    });
+
+    hideOrphanedClearAllRows();
+
+    if (host.style) {
+      host.style.removeProperty('margin-top');
+      host.style.removeProperty('padding-top');
+    }
+    if (toolbar && toolbar.style) {
+      toolbar.style.removeProperty('padding-bottom');
+      toolbar.style.removeProperty('margin-bottom');
+    }
+  }
+
+  function finalizeDismissedFilterLayout() {
+    if (browseUrlHasRemovableActiveFilters()) {
+      return;
+    }
+
+    restoreMainBrowseContentVisibility();
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters, [class*="ActiveFilter"], [class*="AppliedFilter"]').forEach(function (node) {
+      if (!nodeIsStrictDismissedFilterRow(node)) {
+        return;
+      }
+      collapseDismissedFilterNode(node);
+    });
+
+    document.querySelectorAll('.vortex-enhanced-unified-toolbar-row, .vortex-enhanced-sort-toolbar-row, .vortex-enhanced-results-toolbar').forEach(function (toolbar) {
+      toolbar.classList.remove('vortex-enhanced-has-active-filters');
+      if (toolbar.style) {
+        toolbar.style.removeProperty('padding-bottom');
+        toolbar.style.removeProperty('margin-bottom');
+        toolbar.style.removeProperty('min-height');
+      }
+    });
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters-shell, .vortex-enhanced-nexus-active-filters-host').forEach(function (node) {
+      node.classList.remove('vortex-enhanced-nexus-active-filters-shell', 'vortex-enhanced-nexus-active-filters-host');
+    });
+
+    hideOrphanedClearAllRows();
+    collapseFilterGapBetweenToolbarAndGrid();
+  }
+
+  function hideOrphanedClearAllRows() {
+    if (browseUrlHasRemovableActiveFilters()) {
+      return;
+    }
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters, .vortex-enhanced-nexus-clear-all').forEach(function (node) {
+      var row = node.classList && node.classList.contains('vortex-enhanced-nexus-active-filters')
+        ? node
+        : node.closest('.vortex-enhanced-nexus-active-filters');
+      if (!row) {
+        if (isClearAllControl(node)) {
+          row = node.parentElement;
+        }
+      }
+      if (!row || shouldPreserveActiveFilterRow(row)) {
+        return;
+      }
+      row.classList.add('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-nexus-active-filters-empty');
+      row.classList.remove('vortex-enhanced-nexus-active-filters');
+    });
+
+    var clearEl = findNexusClearAllControl(null);
+    if (clearEl && isInMainBrowseColumn(clearEl)) {
+      var clearRow = clearEl.parentElement;
+      if (clearRow && !shouldPreserveActiveFilterRow(clearRow)) {
+        clearRow.classList.add('vortex-enhanced-browse-gap-collapse', 'vortex-enhanced-nexus-active-filters-empty');
+      }
+    }
+  }
+
+  function releaseActiveFiltersShellMarks() {
+    var filtersActive = browseUrlHasRemovableActiveFilters();
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters-shell .vortex-enhanced-browse-trim-hidden').forEach(function (node) {
+      if (!filtersActive || !normalizeUiText(node.textContent)) {
+        node.classList.add('vortex-enhanced-browse-gap-collapse');
+        node.classList.remove('vortex-enhanced-browse-trim-hidden');
+        return;
+      }
+      node.classList.remove('vortex-enhanced-browse-trim-hidden');
+    });
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters-shell, .vortex-enhanced-nexus-active-filters-host, .vortex-enhanced-nexus-browse-header-compact').forEach(function (node) {
+      if (!filtersActive && !node.querySelector('.vortex-enhanced-nexus-active-filters')) {
+        node.classList.add('vortex-enhanced-browse-gap-collapse');
+      }
+      node.classList.remove('vortex-enhanced-nexus-active-filters-shell', 'vortex-enhanced-nexus-active-filters-host', 'vortex-enhanced-nexus-browse-header-compact');
+    });
+  }
+
+  function toolbarChildShouldStayVisible(child) {
+    if (!child) {
+      return false;
+    }
+    if (rowHasVisibleActiveFilterChips(child)) {
+      return true;
+    }
+    if (rowHasSortControls(child)) {
+      return true;
+    }
+    if (child.querySelector('#vortex-enhanced-carousel-controls, #vortex-enhanced-controls-anchor')) {
+      return true;
+    }
+    var text = normalizeUiText(child.textContent);
+    if (/\b[\d][\d,]*\s+(?:results|matching)\b/i.test(text)) {
+      return true;
+    }
+    if (text.indexOf('date published') >= 0 ||
+        text.indexOf('all time') >= 0 ||
+        text.indexOf('prev') >= 0 ||
+        text.indexOf('next') >= 0) {
+      return true;
+    }
+    return false;
+  }
+
+  function collapseEmptyToolbarChildren(toolbar) {
+    if (!toolbar || !toolbar.children || browseUrlHasRemovableActiveFilters()) {
+      return;
+    }
+    Array.prototype.forEach.call(toolbar.children, function (child) {
+      if (toolbarChildShouldStayVisible(child)) {
+        child.classList.remove(
+          'vortex-enhanced-browse-gap-collapse',
+          'vortex-enhanced-nexus-active-filters-empty',
+          'vortex-enhanced-nexus-active-filters'
+        );
+        if (child.style) {
+          child.style.removeProperty('min-height');
+          child.style.removeProperty('height');
+        }
+        return;
+      }
+      if (nodeLooksLikeEmptyFilterSlot(child) || nodeIsStrictDismissedFilterRow(child)) {
+        collapseDismissedFilterNode(child);
+        return;
+      }
+      var text = normalizeUiText(child.textContent);
+      if (!text) {
+        collapseDismissedFilterNode(child);
+        return;
+      }
+      if (text !== 'clear all' &&
+          text.indexOf('excluded:') < 0 &&
+          text.indexOf('excluded translation') < 0) {
+        return;
+      }
+      collapseDismissedFilterNode(child);
+    });
+  }
+
+  function trimBrowseGapAboveGrid() {
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    if (!host) {
+      return;
+    }
+
+    var toolbar = findResultsToolbarRow();
+    if (!browseUrlHasRemovableActiveFilters()) {
+      hideOrphanedClearAllRows();
+      if (toolbar) {
+        toolbar.classList.remove('vortex-enhanced-has-active-filters');
+      }
+    }
+    collapseEmptyToolbarChildren(toolbar);
+
+    var toolbarBottom = toolbar ? toolbar.getBoundingClientRect().bottom : 0;
+    var hostTop = host.getBoundingClientRect().top;
+    var gap = hostTop - toolbarBottom;
+
+    if (gap < 6) {
+      if (toolbar) {
+        toolbar.style.removeProperty('padding-bottom');
+        toolbar.style.removeProperty('margin-bottom');
+        toolbar.style.removeProperty('min-height');
+      }
+      hideOrphanedClearAllRows();
+      return;
+    }
+
+    if (!shouldDeferDismissLayoutCollapse()) {
+      collapseFilterGapBetweenToolbarAndGrid();
+    }
+  }
+
+  function collapseEmptyActiveFiltersLayout() {
+    releaseActiveFiltersShellMarks();
+
+    document.querySelectorAll('.vortex-enhanced-unified-toolbar-row, .vortex-enhanced-sort-toolbar-row').forEach(function (toolbar) {
+      if (!toolbar.querySelector('.vortex-enhanced-nexus-active-filters') ||
+          !rowHasVisibleActiveFilterChips(toolbar)) {
+        toolbar.classList.remove('vortex-enhanced-has-active-filters');
+      }
+    });
+
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters-empty').forEach(function (node) {
+      if (!node.classList.contains('vortex-enhanced-browse-gap-collapse')) {
+        node.classList.remove('vortex-enhanced-nexus-active-filters-empty');
+      }
+    });
+
+    var candidates = document.querySelectorAll('[class*="ResultsHeader"], [class*="ActiveFilter"], [class*="AppliedFilter"]');
+    for (var i = 0; i < candidates.length; i++) {
+      var node = candidates[i];
+      if (!isInMainBrowseColumn(node)) {
+        continue;
+      }
+      if (node.closest('.vortex-enhanced-carousel-host, [data-vortex-enhanced-filters="true"], aside, #filters-panel')) {
+        continue;
+      }
+      if (toolbarChildShouldStayVisible(node)) {
+        continue;
+      }
+      if (node.querySelector('.vortex-enhanced-carousel-host')) {
+        continue;
+      }
+
+      var text = normalizeUiText(node.textContent);
+      var lookedLikeFilters = rowLooksLikeNexusActiveFilters(node) ||
+        text.indexOf('excluded:') >= 0 ||
+        (text.indexOf('clear all') >= 0 && text.length < 32);
+      if (!lookedLikeFilters && text) {
+        continue;
+      }
+      if (shouldPreserveActiveFilterRow(node)) {
+        node.classList.remove('vortex-enhanced-nexus-active-filters-empty', 'vortex-enhanced-browse-gap-collapse');
+        continue;
+      }
+
+      node.classList.add('vortex-enhanced-nexus-active-filters-empty');
+      node.classList.add('vortex-enhanced-browse-gap-collapse');
+      node.classList.remove('vortex-enhanced-nexus-active-filters');
+    }
+
+    hideOrphanedClearAllRows();
+    trimBrowseGapAboveGrid();
+  }
+
+  function compactActiveFiltersShell(row) {
+    if (!row) {
+      return;
+    }
+    var shell = row.parentElement;
+    for (var depth = 0; depth < 5 && shell; depth++) {
+      if (!isInMainBrowseColumn(shell)) {
+        break;
+      }
+      shell.classList.add('vortex-enhanced-nexus-active-filters-shell');
+      shell.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-nexus-active-filters-empty');
+      if (shell.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row')) {
+        Array.prototype.forEach.call(shell.children, function (child) {
+          if (child === row || child.contains(row)) {
+            return;
+          }
+          if (child.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row')) {
+            return;
+          }
+          var childText = normalizeUiText(child.textContent);
+          if (!childText) {
+            child.classList.add('vortex-enhanced-browse-trim-hidden');
+          }
+        });
+      }
+      if (shell.matches && shell.matches('[class*="ResultsHeader"]')) {
+        break;
+      }
+      shell = shell.parentElement;
+    }
+  }
+
+  function resolveNexusFilterChipActionTarget(node, row) {
+    if (!node || !row || !row.contains(node)) {
+      return null;
+    }
+
+    var clearNode = node.closest('.vortex-enhanced-nexus-clear-all') ||
+      (isClearAllControl(node) ? node : null);
+    if (clearNode && row.contains(clearNode)) {
+      return clearNode.closest('button, a, [role="button"]') || clearNode;
+    }
+
+    var chip = node.closest('button, a, [role="button"]');
+    if (!chip || !row.contains(chip)) {
+      return null;
+    }
+    if (isClearAllControl(chip)) {
+      return chip;
+    }
+
+    var chipText = normalizeUiText(chip.textContent);
+    if (chipText.indexOf('excluded:') >= 0 ||
+        chipText.indexOf('hide adult') >= 0 ||
+        chipText.indexOf('hide installed') >= 0 ||
+        chipText.indexOf('only installed') >= 0 ||
+        chipText.indexOf('hide tracked') >= 0 ||
+        chipText.indexOf('only tracked') >= 0) {
+      if (node !== chip) {
+        var nested = node.closest('button, [role="button"]');
+        if (nested && chip.contains(nested) && nested !== chip) {
+          return nested;
+        }
+      }
+      return chip;
+    }
+
+    return chip;
+  }
+
+  function triggerNativeFilterControlClick(target) {
+    if (!target || !target.isConnected) {
+      return false;
+    }
+
+    enhancer.allowNexusPaginationClick = true;
+    try {
+      target.click();
+      return true;
+    } catch (errClick) {
+      return false;
+    } finally {
+      setTimeout(function () {
+        enhancer.allowNexusPaginationClick = false;
+      }, 300);
+    }
+  }
+
+  function ensureActiveFilterRowInteraction(row) {
+    if (!row || row.getAttribute('data-vortex-active-filter-click') === 'true') {
+      return;
+    }
+    row.setAttribute('data-vortex-active-filter-click', 'true');
+    row.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) {
+        return;
+      }
+
+      noteNexusActiveFilterUserAction(event);
+
+      var actionTarget = resolveNexusFilterChipActionTarget(event.target, row);
+      if (!actionTarget) {
+        return;
+      }
+
+      if (event.target === actionTarget) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      triggerNativeFilterControlClick(actionTarget);
+    }, true);
+  }
+
+  function layoutNexusActiveFiltersInline() {
+    document.querySelectorAll('.vortex-enhanced-nexus-active-filters').forEach(function (node) {
+      if (node.style) {
+        node.style.removeProperty('display');
+        node.style.removeProperty('flex-direction');
+        node.style.removeProperty('flex-wrap');
+        node.style.removeProperty('align-items');
+        node.style.removeProperty('gap');
+        node.style.removeProperty('margin');
+        node.style.removeProperty('padding');
+        node.style.removeProperty('min-height');
+        node.style.removeProperty('width');
+      }
+      node.classList.remove('vortex-enhanced-nexus-active-filters');
+    });
+    releaseActiveFiltersShellMarks();
+
+    var row = findNexusActiveFilterRow();
+    if (!row || !isInMainBrowseColumn(row)) {
+      if (isTranslationFilterDismissedBrowse()) {
+        syncDismissedFilterBrowseState();
+        return null;
+      }
+      if (!browseUrlHasRemovableActiveFilters()) {
+        hideOrphanedClearAllRows();
+      } else {
+        collapseEmptyActiveFiltersLayout();
+      }
+      return null;
+    }
+
+    row.classList.add('vortex-enhanced-nexus-active-filters');
+    ensureActiveFilterRowVisible(row);
+
+    var toolbar = row.closest('.vortex-enhanced-unified-toolbar-row, .vortex-enhanced-sort-toolbar-row');
+    if (toolbar) {
+      toolbar.classList.add('vortex-enhanced-has-active-filters');
+    }
+
+    var clearEl = findNexusClearAllControl(row) || findNexusClearAllControl(null);
+    if (clearEl) {
+      clearEl.classList.add('vortex-enhanced-nexus-clear-all');
+      clearEl.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+    }
+
+    var translationChip = findTranslationFilterChipAnywhere();
+    if (translationChip) {
+      var chipRow = translationChip.closest('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]') || translationChip.parentElement;
+      if (chipRow && chipRow !== row) {
+        ensureActiveFilterRowVisible(chipRow);
+        chipRow.classList.add('vortex-enhanced-nexus-active-filters');
+      } else {
+        ensureActiveFilterRowVisible(translationChip);
+      }
+    }
+
+    compactActiveFiltersShell(row);
+    ensureActiveFilterRowInteraction(row);
+
+    if (translationFilterExcludedInUrl() && !findExcludedTranslationChipInRow(row)) {
+      setTimeout(function () {
+        if (window.__vortexBrowseEnhancer) {
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        }
+      }, 450);
+    }
+
+    return row;
+  }
+
+  function unhideBrowseContentChain(node) {
+    var current = node;
+    while (current && current !== document.documentElement) {
+      if (current.id === 'siteHeader' ||
+          current.id === 'site-header' ||
+          (current.tagName === 'HEADER' && !current.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-nexus-active-filters'))) {
+        break;
+      }
+      if (current.classList && (
+        current.classList.contains('vortex-enhanced-chrome-hidden') ||
+        current.classList.contains('vortex-enhanced-browse-trim-hidden')
+      )) {
+        current.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+      } else if (current.classList) {
+        current.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+      }
+      current = current.parentElement;
+    }
+  }
+
+  function protectNexusActiveFiltersRow() {
+    return layoutNexusActiveFiltersInline();
+  }
+
+  function rowLooksLikeResultsToolbarContainer(node) {
+    if (!node || !node.querySelector) {
+      return false;
+    }
+    return !!(
+      node.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row') ||
+      rowHasSortControls(node) ||
+      /\b[\d][\d,]* results\b/i.test(normalizeUiText(node.textContent))
+    );
+  }
+
+  function protectNexusBrowseHeaderStack() {
+    var toolbar = findResultsToolbarRow();
+    if (toolbar && isInMainBrowseColumn(toolbar)) {
+      toolbar.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+      unhideBrowseContentChain(toolbar);
+    }
+    if (isTranslationFilterDismissedBrowse()) {
+      syncDismissedFilterBrowseState();
+      return toolbar;
+    }
+    var row = layoutNexusActiveFiltersInline();
+    trimBrowseGapAboveGrid();
+    return row || toolbar;
+  }
+
+  function shouldPreserveMainColumnBrowseChrome(node) {
+    if (!node) {
+      return false;
+    }
+    if (rowHasSortControls(node) || rowLooksLikeResultsToolbarContainer(node)) {
+      return true;
+    }
+    if (node.classList &&
+        (node.classList.contains('vortex-enhanced-results-toolbar') ||
+         node.classList.contains('vortex-enhanced-nexus-active-filters'))) {
+      return true;
+    }
+    if (browseUrlHasRemovableActiveFilters() &&
+        rowHasVisibleActiveFilterChips(node) &&
+        (rowLooksLikeNexusActiveFilters(node) || shouldPreserveActiveFilterRow(node))) {
+      return true;
+    }
+    if (node.querySelector &&
+        node.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row, [data-e2eid="mod-tile"]')) {
+      return true;
+    }
+    return false;
   }
 
   function shouldKeepVisibleInHideChrome(node, host) {
@@ -6577,13 +15510,22 @@
     if (node === host || node.contains(host)) {
       return true;
     }
-    if (node.tagName === 'ASIDE' &&
-        (node.classList.contains('vortex-enhanced-nexus-filters-open') || isNexusFiltersPanelOpen())) {
+    if (node.classList && node.classList.contains('vortex-enhanced-nexus-active-filters')) {
+      return browseUrlHasRemovableActiveFilters() && rowHasVisibleActiveFilterChips(node);
+    }
+    if ((node.tagName === 'ASIDE' || node.id === 'filters-panel') &&
+        (node.classList.contains('vortex-enhanced-nexus-filters-open') || isNexusFiltersPanelVisible())) {
       return true;
     }
     if (node.querySelector && node.querySelector(
-      '.vortex-enhanced-carousel-host, .vortex-enhanced-grid-layout, .vortex-enhanced-sort-toolbar-row, [data-vortex-enhanced-ui="true"]'
+      '.vortex-enhanced-carousel-host, .vortex-enhanced-grid-layout, .vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row, .vortex-enhanced-nexus-active-filters, [data-vortex-enhanced-ui="true"], [data-e2eid="mod-tile"]'
     )) {
+      return true;
+    }
+    if (rowLooksLikeResultsToolbarContainer(node)) {
+      return true;
+    }
+    if (rowLooksLikeNexusActiveFilters(node)) {
       return true;
     }
     if (nodeHasVortexEnhancedUi(node)) {
@@ -6592,8 +15534,30 @@
     return false;
   }
 
+  function isValidFilterToolbarRow(row) {
+    if (!row || !isInMainBrowseColumn(row, { ignoreVisibility: true })) {
+      return false;
+    }
+    if (row.closest('aside') || row.tagName === 'ASIDE' || row.querySelector('aside')) {
+      return false;
+    }
+    var text = normalizeUiText(row.textContent);
+    if (text.indexOf('vortex filters') >= 0 ||
+        text.indexOf('categories') >= 0 ||
+        text.indexOf('language support') >= 0) {
+      return false;
+    }
+    return rowHasVisibleActiveFilterChips(row) ||
+      !!findNexusClearAllControl(row) ||
+      hasVisibleNexusFilterChipText() ||
+      !!row.querySelector('[data-vortex-results-headline="true"]');
+  }
+
   function isValidCarouselToolbarRow(row) {
-    if (!row || !rowHasSortControls(row)) {
+    if (!row) {
+      return false;
+    }
+    if (!rowHasSortControls(row)) {
       return false;
     }
     if (row.closest('aside') || row.tagName === 'ASIDE') {
@@ -6609,6 +15573,52 @@
       return false;
     }
     return !rowLooksLikeResultsHeader(row);
+  }
+
+  function findFilteredResultsToolbarRow() {
+    var row = findNexusActiveFilterRow();
+    if (row && isValidFilterToolbarRow(row)) {
+      return row;
+    }
+    row = document.querySelector('.vortex-enhanced-nexus-active-filters');
+    if (row && isValidFilterToolbarRow(row)) {
+      return row;
+    }
+    var headline = findResultsHeadlineElement();
+    if (headline) {
+      var el = headline.parentElement;
+      for (var depth = 0; depth < 8 && el; depth++) {
+        if (rowHasSortControls(el)) {
+          break;
+        }
+        if (isValidFilterToolbarRow(el)) {
+          return el;
+        }
+        el = el.parentElement;
+      }
+      var chipShell = headline.closest('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]');
+      if (chipShell && isValidFilterToolbarRow(chipShell)) {
+        return chipShell;
+      }
+    }
+    return null;
+  }
+
+  function mountCarouselControlsInSortRow(row) {
+    if (!row || !rowHasSortControls(row)) {
+      return false;
+    }
+    clearInHostControlsBar();
+    removeControlsFallbackBar();
+    row.classList.add('vortex-enhanced-results-toolbar', 'vortex-enhanced-sort-toolbar-row');
+    var anchor = ensureControlsAnchor(row);
+    var controls = ensureCarouselControls();
+    if (controls.parentElement !== anchor) {
+      anchor.appendChild(controls);
+    }
+    enhancer.controlsPinnedFilterRow = null;
+    enhancer.controlsPinnedSortRow = row;
+    return true;
   }
 
   function cleanupInvalidToolbarRows() {
@@ -6653,16 +15663,22 @@
       return marked;
     }
 
-    var nodes = document.querySelectorAll('span, div, p, strong');
-    for (var i = 0; i < nodes.length; i++) {
-      var node = nodes[i];
-      if (node.closest('.vortex-enhanced-carousel-controls, [data-vortex-enhanced-filters="true"]')) {
-        continue;
+    var resultsHeadline = null;
+    var matchingHeadline = null;
+    walkResultsCountLabelHosts(function (host, _text, label) {
+      if (label === 'results' && !resultsHeadline) {
+        resultsHeadline = host;
+        return false;
       }
-      var text = normalizeUiText(node.textContent);
-      if (/^[\d][\d,]* results$/i.test(text)) {
-        return node;
+      if (label === 'matching' && !matchingHeadline) {
+        matchingHeadline = host;
       }
+    });
+    if (resultsHeadline) {
+      return resultsHeadline;
+    }
+    if (!hasNumericNexusBrowseFilters() && matchingHeadline) {
+      return matchingHeadline;
     }
     return null;
   }
@@ -6775,14 +15791,21 @@
   }
 
   function findResultsToolbarRow() {
-    var unified = findUnifiedToolbarRow();
-    if (unified) {
-      return unified;
+    if (enhancer.controlsPinnedSortRow && document.body.contains(enhancer.controlsPinnedSortRow)) {
+      return enhancer.controlsPinnedSortRow;
     }
 
     var sortRow = findSortToolbarRow();
     if (sortRow) {
+      enhancer.controlsPinnedSortRow = sortRow;
       return sortRow;
+    }
+
+    if (!enhancer.filteredBrowseEngaged && !enhancer.domFilterBrowseActive && !hasVisibleNexusFilterChipText()) {
+      var unified = findUnifiedToolbarRow();
+      if (unified && rowHasSortControls(unified) && !rowLooksLikeResultsHeader(unified)) {
+        return unified;
+      }
     }
 
     var showFilters = findShowFiltersRow();
@@ -6911,6 +15934,36 @@
     return anchor;
   }
 
+  function bindCarouselControlButtons(controls) {
+    if (!controls) {
+      return;
+    }
+    var buttons = controls.querySelectorAll('.vortex-enhanced-carousel-btn[data-carousel]');
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      if (btn.getAttribute('data-vortex-bound') === '1') {
+        continue;
+      }
+      btn.setAttribute('data-vortex-bound', '1');
+      btn.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+          event.stopImmediatePropagation();
+        }
+        var delta = parseInt(this.getAttribute('data-carousel'), 10);
+        if (delta) {
+          traceStep('carousel-btn-click', { delta: delta, page: (enhancer.globalPageIndex || 0) + 1 });
+          if (shouldUseNumericFilteredBrowseScan(enhancer.config)) {
+            advanceNumericFilteredCarouselPage(enhancer.config, delta);
+          } else {
+            advanceCarouselPage(delta);
+          }
+        }
+      }, true);
+    }
+  }
+
   function ensureCarouselControls() {
     var controls = document.getElementById('vortex-enhanced-carousel-controls');
     if (!controls) {
@@ -6929,6 +15982,7 @@
         '<button type="button" class="vortex-enhanced-carousel-btn" data-carousel="1" aria-label="Next page">Next</button>';
     }
 
+    bindCarouselControlButtons(controls);
     syncAutoAdvanceUi();
     return controls;
   }
@@ -6936,23 +15990,34 @@
   function ensureCarouselControlsBar() {
     var controls = ensureCarouselControls();
     var hideChrome = !!(enhancer.config && enhancer.config.hideSiteChrome);
-    var toolbarRow = findResultsToolbarRow();
 
-    if (toolbarRow && isValidCarouselToolbarRow(toolbarRow)) {
-      clearInHostControlsBar();
-      toolbarRow.classList.add('vortex-enhanced-results-toolbar');
-      var anchor = ensureControlsAnchor(toolbarRow);
-      if (controls.parentElement !== anchor) {
-        anchor.appendChild(controls);
-      }
-      removeControlsFallbackBar();
+    var sortRow = findSortToolbarRow();
+    if (sortRow && rowHasSortControls(sortRow)) {
+      mountCarouselControlsInSortRow(sortRow);
       if (hideChrome) {
         protectBrowseControlsFromChromeHide();
       }
       return controls;
     }
 
-    if (hideChrome) {
+    if (enhancer.controlsPinnedSortRow && document.body.contains(enhancer.controlsPinnedSortRow)) {
+      mountCarouselControlsInSortRow(enhancer.controlsPinnedSortRow);
+      if (hideChrome) {
+        protectBrowseControlsFromChromeHide();
+      }
+      return controls;
+    }
+
+    var toolbarRow = findResultsToolbarRow();
+    if (toolbarRow && isValidCarouselToolbarRow(toolbarRow)) {
+      mountCarouselControlsInSortRow(toolbarRow);
+      if (hideChrome) {
+        protectBrowseControlsFromChromeHide();
+      }
+      return controls;
+    }
+
+    if (hideChrome && !enhancer.filteredBrowseEngaged) {
       if (mountControlsInCarouselHost(controls)) {
         protectBrowseControlsFromChromeHide();
         return controls;
@@ -6980,12 +16045,22 @@
         if (!document.querySelector('.vortex-enhanced-grid-layout')) {
           return;
         }
-        var toolbarRow = findResultsToolbarRow();
+        var sortRow = findSortToolbarRow();
+        if (sortRow && rowHasSortControls(sortRow)) {
+          mountCarouselControlsInSortRow(sortRow);
+          protectBrowseControlsFromChromeHide();
+          return;
+        }
+        if (enhancer.controlsPinnedSortRow && document.body.contains(enhancer.controlsPinnedSortRow)) {
+          mountCarouselControlsInSortRow(enhancer.controlsPinnedSortRow);
+          protectBrowseControlsFromChromeHide();
+          return;
+        }
         var controls = ensureCarouselControlsBar();
         if (controls && !controlsAreVisible(controls)) {
-          if (enhancer.config && enhancer.config.hideSiteChrome) {
+          if (enhancer.config && enhancer.config.hideSiteChrome && !enhancer.filteredBrowseEngaged) {
             mountControlsInCarouselHost(controls);
-          } else if (!toolbarRow) {
+          } else if (!sortRow) {
             mountControlsFallback(controls);
           }
         }
@@ -7051,16 +16126,18 @@
   }
 
   function installCarouselWheelHandler() {
-    if (window.__vortexBrowseEnhancerWheelNav) {
+    if (!markVortexDocumentHook('carousel-wheel-nav')) {
       return;
     }
-    window.__vortexBrowseEnhancerWheelNav = true;
 
     var lastWheelAdvance = 0;
     var wheelAccum = 0;
     document.addEventListener('wheel', function (event) {
       if (!document.querySelector('.vortex-enhanced-carousel-host')) {
-        return;
+        if (!document.documentElement.classList.contains('vortex-enhanced-filtered-browse') &&
+            !(enhancer.config && isFilteredBrowseSession(enhancer.config))) {
+          return;
+        }
       }
 
       if (enhancer.localCatalogNavLock) {
@@ -7085,22 +16162,35 @@
         return;
       }
 
-      event.preventDefault();
-      event.stopPropagation();
-
       wheelAccum += event.deltaY;
       var now = Date.now();
       if (Math.abs(wheelAccum) < 80) {
         return;
       }
-      if (now - lastWheelAdvance < 650) {
+      var wheelQuietMs = 100;
+      if (now - lastWheelAdvance < wheelQuietMs) {
+        wheelAccum = 0;
+        return;
+      }
+      if (enhancer.dismissedPoolPagingActive || enhancer.carouselAdvancePending ||
+          enhancer.dismissedBatchPrefetchInFlight) {
+        wheelAccum = 0;
         return;
       }
 
-      lastWheelAdvance = now;
       var delta = wheelAccum > 0 ? 1 : -1;
       wheelAccum = 0;
-      advanceCarouselPage(delta);
+      if (delta < 0 && enhancer.globalPageIndex <= 0) {
+        return;
+      }
+      lastWheelAdvance = now;
+      event.preventDefault();
+      event.stopPropagation();
+      if (wheelConfig && shouldUseNumericFilteredBrowseScan(wheelConfig)) {
+        advanceNumericFilteredCarouselPage(wheelConfig, delta);
+      } else {
+        advanceCarouselPage(delta);
+      }
     }, { passive: false, capture: true });
   }
 
@@ -7182,17 +16272,6 @@
     var grid = findModGrid();
 
     if (config.hideSiteChrome) {
-      var topTarget = document.getElementById('vortex-enhanced-controls-bar') ||
-        controls || toolbar || host || grid;
-      if (!topTarget) {
-        return;
-      }
-      var topRect = topTarget.getBoundingClientRect();
-      var topPadding = 8;
-      var alignTopScrollY = window.scrollY + topRect.top - topPadding;
-      if (Math.abs(alignTopScrollY - window.scrollY) > 8) {
-        window.scrollTo({ top: Math.max(0, alignTopScrollY), behavior: 'instant' });
-      }
       return;
     }
 
@@ -7221,6 +16300,26 @@
   }
 
   function mountVortexFilterPanel(panel) {
+    var aside = findNexusFilterAside() || document.querySelector('aside');
+    var filtersOpen = isNexusFiltersPanelOpen();
+    var hideChrome = !!(enhancer.config && enhancer.config.hideSiteChrome);
+
+    if (filtersOpen && aside) {
+      panel.classList.add('vortex-enhanced-filter-panel-aside');
+      panel.classList.remove('vortex-enhanced-filter-panel-inline');
+      aside.insertBefore(panel, aside.firstChild);
+      return true;
+    }
+
+    if (hideChrome && aside) {
+      panel.classList.add('vortex-enhanced-filter-panel-aside');
+      panel.classList.remove('vortex-enhanced-filter-panel-inline');
+      if (panel.parentElement !== aside) {
+        aside.insertBefore(panel, aside.firstChild);
+      }
+      return true;
+    }
+
     var showFiltersRow = findShowFiltersRow();
     if (showFiltersRow && showFiltersRow.parentElement) {
       panel.classList.add('vortex-enhanced-filter-panel-inline');
@@ -7234,7 +16333,6 @@
       return true;
     }
 
-    var aside = document.querySelector('aside');
     if (aside) {
       panel.classList.add('vortex-enhanced-filter-panel-aside');
       panel.classList.remove('vortex-enhanced-filter-panel-inline');
@@ -7357,6 +16455,7 @@
   }
 
   function protectBrowseControlsFromChromeHide() {
+    protectNexusBrowseHeaderStack();
     var selectors = [
       '#vortex-enhanced-carousel-controls',
       '#vortex-enhanced-controls-bar',
@@ -7365,6 +16464,7 @@
       '.vortex-enhanced-sort-toolbar-row',
       '.vortex-enhanced-controls-bar-fallback',
       '.vortex-enhanced-controls-bar-in-host',
+      '.vortex-enhanced-nexus-active-filters',
       '[data-vortex-enhanced-ui="true"]',
     ];
     selectors.forEach(function (sel) {
@@ -7373,11 +16473,21 @@
         unhideVortexUiAncestors(node);
       });
     });
+    if (enhancer.config && enhancer.config.hideSiteChrome) {
+      hideNexusItemsPerPageUi();
+    }
   }
 
   function markNodeChromeHidden(node) {
     if (!node || nodeHasVortexEnhancedUi(node)) {
       return;
+    }
+    if (enhancer.userWantsNexusFiltersOpen || isNexusFiltersPanelVisible()) {
+      if (node.id === 'filters-panel' ||
+          (node.matches && node.matches('aside')) ||
+          (node.closest && node.closest('#filters-panel, aside.vortex-enhanced-nexus-filters-open'))) {
+        return;
+      }
     }
     if (node.querySelector && node.querySelector(
       '#vortex-enhanced-carousel-controls, #vortex-enhanced-controls-bar, [data-vortex-enhanced-ui="true"]'
@@ -7435,126 +16545,74 @@
     }
   }
 
-  function applyHideSiteChrome(config) {
-    if (!config || !config.hideSiteChrome) {
-      document.documentElement.classList.remove('vortex-enhanced-hide-chrome');
-      stopChromeHideWatchdog();
-      document.querySelectorAll('.vortex-enhanced-chrome-hidden').forEach(function (node) {
-        node.classList.remove('vortex-enhanced-chrome-hidden');
-      });
+  function revealActiveFilterUiForCurrentUrl() {
+    if (!browseUrlHasRemovableActiveFilters()) {
       return;
     }
-    document.documentElement.classList.add('vortex-enhanced-hide-chrome');
-    hideNexusChromeAboveGrid();
-    hideNexusGameBannerStrip();
-    protectBrowseControlsFromChromeHide();
-    ensureChromeHideWatchdog(config);
+
+    document.querySelectorAll('[class*="ActiveFilter"], [class*="AppliedFilter"], [class*="ResultsHeader"]').forEach(function (node) {
+      if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+        return;
+      }
+      var text = normalizeUiText(node.textContent);
+      if (text.indexOf('clear all') < 0 &&
+          text.indexOf('excluded') < 0 &&
+          text.indexOf('translation') < 0) {
+        return;
+      }
+      node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden', 'vortex-enhanced-browse-gap-collapse');
+      if (text.indexOf('clear all') >= 0 || text.indexOf('excluded') >= 0 || text.indexOf('translation') >= 0) {
+        node.classList.add('vortex-enhanced-nexus-active-filters');
+        ensureActiveFilterRowVisible(node);
+      }
+    });
   }
 
-  function ensureHideSiteChrome(config) {
-    applyHideSiteChrome(config);
-  }
-
-  function scheduleChromeHideRefresh() {
+  function hideResultsHeaderNonToolbarSections() {
     if (!enhancer.config || !enhancer.config.hideSiteChrome) {
       return;
     }
-    if (enhancer.chromeHideDebounceTimer) {
-      return;
-    }
-    enhancer.chromeHideDebounceTimer = setTimeout(function () {
-      enhancer.chromeHideDebounceTimer = null;
-      if (enhancer.config && enhancer.config.hideSiteChrome && !isBrowseEnhancementPaused()) {
-        hideNexusChromeAboveGrid();
-        hideNexusGameBannerStrip();
-        protectBrowseControlsFromChromeHide();
-      }
-    }, 80);
-  }
 
-  function ensureChromeHideWatchdog(config) {
-    if (!config || !config.hideSiteChrome) {
-      stopChromeHideWatchdog();
-      return;
-    }
-    if (enhancer.chromeHideWatchdogTimer) {
-      return;
-    }
-    enhancer.chromeHideWatchdogTimer = setInterval(function () {
-      if (!enhancer.config || !enhancer.config.hideSiteChrome || isBrowseEnhancementPaused()) {
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    document.querySelectorAll('[class*="ResultsHeader"], [class*="ModsToolbar"], [class*="ModsHeader"]').forEach(function (shell) {
+      if (!isInMainBrowseColumn(shell, { ignoreVisibility: true })) {
         return;
       }
-      if (!isBrowseModsListPathname(getBrowsePathname())) {
+      if (!rowHasSortControls(shell) &&
+          !rowLooksLikeResultsToolbarContainer(shell) &&
+          !shell.querySelector('.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row')) {
+        markNodeChromeHidden(shell);
         return;
       }
-      hideNexusChromeAboveGrid();
-      hideNexusGameBannerStrip();
-      protectBrowseControlsFromChromeHide();
-    }, 1500);
+      for (var i = 0; i < shell.children.length; i++) {
+        var child = shell.children[i];
+        if (shouldKeepVisibleInHideChrome(child, host || shell)) {
+          child.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+          continue;
+        }
+        if (rowHasSortControls(child) ||
+            rowLooksLikeResultsToolbarContainer(child) ||
+            child.classList.contains('vortex-enhanced-nexus-active-filters') ||
+            child.querySelector(
+              '.vortex-enhanced-sort-toolbar-row, .vortex-enhanced-unified-toolbar-row, .vortex-enhanced-nexus-active-filters, [data-vortex-enhanced-ui="true"]'
+            )) {
+          child.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+          continue;
+        }
+        if (!nodeHasVortexEnhancedUi(child)) {
+          markNodeChromeHidden(child);
+        }
+      }
+    });
   }
 
-  function stopChromeHideWatchdog() {
-    if (enhancer.chromeHideWatchdogTimer) {
-      clearInterval(enhancer.chromeHideWatchdogTimer);
-      enhancer.chromeHideWatchdogTimer = null;
-    }
-    if (enhancer.chromeHideDebounceTimer) {
-      clearTimeout(enhancer.chromeHideDebounceTimer);
-      enhancer.chromeHideDebounceTimer = null;
-    }
-  }
-
-  function hideNexusChromeAboveGrid() {
-    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid() || findSortToolbarRow();
+  function hideChromeSiblingsAroundHost(host) {
+    host = host || document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
     if (!host) {
-      hideNexusGameBannerStrip(null);
       return;
     }
 
     host.classList.remove('vortex-enhanced-chrome-hidden');
-
-    var selectors = [
-      'header',
-      'footer',
-      'aside',
-      '#siteHeader',
-      '#site-header',
-      '[class*="GlobalHeader"]',
-      '[class*="GlobalNav"]',
-      '[class*="SiteHeader"]',
-      '[class*="site-footer"]',
-      '[class*="ModsToolbar"]',
-      '[class*="ResultsHeader"]',
-      '[class*="Breadcrumbs"]',
-      '[class*="GameHeader"]',
-      '[class*="PageHero"]',
-      '[class*="HeroBanner"]',
-      '[class*="CoverBanner"]',
-      '[class*="ModsHeader"]',
-      '[class*="GameBanner"]',
-    ];
-    selectors.forEach(function (selector) {
-      document.querySelectorAll(selector).forEach(function (node) {
-        if (nodeHasVortexEnhancedUi(node) ||
-            (node.classList && node.classList.contains('vortex-enhanced-results-toolbar'))) {
-          node.classList.remove('vortex-enhanced-chrome-hidden');
-          return;
-        }
-        if (!host.contains(node) && !node.contains(host)) {
-          if (selector === 'aside') {
-            if (node.classList.contains('vortex-enhanced-nexus-filters-open') || isNexusFiltersPanelOpen()) {
-              node.classList.add('vortex-enhanced-nexus-filters-open');
-              node.classList.remove('vortex-enhanced-chrome-hidden');
-              node.classList.remove('vortex-enhanced-browse-trim-hidden');
-              return;
-            }
-            node.classList.add('vortex-enhanced-chrome-hidden');
-            return;
-          }
-          node.classList.add('vortex-enhanced-chrome-hidden');
-        }
-      });
-    });
 
     var node = host;
     for (var depth = 0; depth < 6 && node; depth++) {
@@ -7572,10 +16630,15 @@
           continue;
         }
         if (sibling.tagName === 'ASIDE' || sibling.id === 'filters-panel') {
-          if (sibling.classList.contains('vortex-enhanced-nexus-filters-open') || isNexusFiltersPanelOpen()) {
+          if (isNexusFiltersPanelOpen() ||
+              sibling.classList.contains('vortex-enhanced-nexus-filters-open') ||
+              enhancer.userWantsNexusFiltersOpen) {
+            markNexusFiltersPanelOpen(true);
             sibling.classList.add('vortex-enhanced-nexus-filters-open');
-            sibling.classList.remove('vortex-enhanced-chrome-hidden');
-            sibling.classList.remove('vortex-enhanced-browse-trim-hidden');
+            sibling.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+            if (sibling.style) {
+              sibling.style.removeProperty('display');
+            }
           } else {
             sibling.classList.add('vortex-enhanced-chrome-hidden');
           }
@@ -7602,9 +16665,346 @@
       }
       prev = prev.previousElementSibling;
     }
+  }
 
-    hideNexusGameBannerStrip(host);
+  function applyDismissedBrowseHideChrome(config) {
+    document.documentElement.classList.add('vortex-enhanced-hide-chrome');
+    ensureDismissedBrowseChromeSafe();
+    syncBrowseUrlFilterDocumentState();
     protectBrowseControlsFromChromeHide();
+    hideNexusSiteBannerChrome();
+    hideResultsHeaderNonToolbarSections();
+    hideChromeSiblingsAroundHost();
+    hideNexusGameBannerStrip();
+    hideBrowsePageFooter();
+    layoutNexusActiveFiltersInline();
+    ensureCarouselControlsBar();
+    hideNexusItemsPerPageUi();
+    ensureChromeHideWatchdog(config);
+  }
+
+  function isTranslationDismissHandsOff() {
+    return !!(enhancer.userDismissedTranslationFilter &&
+      enhancer.translationDismissHandsOffUntil &&
+      Date.now() < enhancer.translationDismissHandsOffUntil);
+  }
+
+  function unhideBrowseToolbarAndGrid() {
+    var selectors = [
+      '.vortex-enhanced-carousel-host',
+      '.vortex-enhanced-grid-layout',
+      '.vortex-enhanced-unified-toolbar-row',
+      '.vortex-enhanced-sort-toolbar-row',
+      '.vortex-enhanced-results-toolbar',
+      '#vortex-enhanced-carousel-controls',
+      '#vortex-enhanced-controls-bar',
+      '#vortex-enhanced-controls-anchor',
+      '[data-vortex-enhanced-ui="true"]',
+    ];
+    selectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        node.classList.remove(
+          'vortex-enhanced-chrome-hidden',
+          'vortex-enhanced-browse-trim-hidden',
+          'vortex-enhanced-browse-gap-collapse',
+          'vortex-enhanced-nexus-active-filters-empty'
+        );
+        unhideBrowseContentChain(node);
+      });
+    });
+
+    document.querySelectorAll('[class*="ResultsHeader"], [class*="ActiveFilter"], [class*="AppliedFilter"]').forEach(function (node) {
+      if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+        return;
+      }
+      if (rowLooksLikeResultsToolbarContainer(node) || rowHasSortControls(node)) {
+        node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+        unhideBrowseContentChain(node);
+      }
+    });
+  }
+
+  function hideNexusSiteBannerChrome() {
+    var bannerSelectors = [
+      'header',
+      'footer',
+      '#siteHeader',
+      '#site-header',
+      '[class*="GlobalHeader"]',
+      '[class*="GlobalNav"]',
+      '[class*="SiteHeader"]',
+      '[class*="site-footer"]',
+      '[class*="Breadcrumbs"]',
+      '[class*="GameHeader"]',
+      '[class*="PageHero"]',
+      '[class*="HeroBanner"]',
+      '[class*="CoverBanner"]',
+      '[class*="ModsHeader"]',
+      '[class*="GameBanner"]',
+    ];
+    bannerSelectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        if (nodeHasVortexEnhancedUi(node) || rowLooksLikeResultsToolbarContainer(node)) {
+          node.classList.remove('vortex-enhanced-chrome-hidden');
+          return;
+        }
+        if (node.closest('.vortex-enhanced-carousel-host, .vortex-enhanced-unified-toolbar-row, .vortex-enhanced-sort-toolbar-row')) {
+          return;
+        }
+        if (isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+          if (shouldPreserveMainColumnBrowseChrome(node)) {
+            node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+            return;
+          }
+          markNodeChromeHidden(node);
+          return;
+        }
+        markNodeChromeHidden(node);
+      });
+    });
+    hideNexusGameBannerStrip(null);
+    hideMainColumnHeroAboveCarousel();
+  }
+
+  function hideMainColumnHeroAboveCarousel() {
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    if (!host) {
+      return;
+    }
+    document.querySelectorAll('nav, ol, ul, section, div, header').forEach(function (node) {
+      if (!isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+        return;
+      }
+      if (node === host || node.contains(host) || host.contains(node)) {
+        return;
+      }
+      if (shouldPreserveMainColumnBrowseChrome(node) || shouldKeepVisibleInHideChrome(node, host)) {
+        return;
+      }
+      var text = normalizeUiText(node.textContent);
+      if (text.indexOf('home >') >= 0 ||
+          (/\bmods$/i.test(text) && text.length < 80) ||
+          (node.querySelector('img') && !node.querySelector('[data-e2eid="mod-tile"]') && text.length < 160)) {
+        markNodeChromeHidden(node);
+      }
+    });
+  }
+
+  function clearAuthPageEnhancement() {
+    document.documentElement.classList.remove(
+      'vortex-enhanced-hide-chrome',
+      'vortex-enhanced-browse-wide',
+      'vortex-enhanced-translation-dismissed'
+    );
+    document.documentElement.classList.add('vortex-enhanced-auth-page');
+    stopChromeHideWatchdog();
+    document.querySelectorAll('.vortex-enhanced-chrome-hidden, .vortex-enhanced-browse-trim-hidden').forEach(function (node) {
+      node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+    });
+  }
+
+  function applyHideSiteChrome(config) {
+    if (isNexusAuthPage()) {
+      clearAuthPageEnhancement();
+      return;
+    }
+    document.documentElement.classList.remove('vortex-enhanced-auth-page');
+    if (!config || !config.hideSiteChrome) {
+      document.documentElement.classList.remove('vortex-enhanced-hide-chrome');
+      stopChromeHideWatchdog();
+      document.querySelectorAll('.vortex-enhanced-chrome-hidden').forEach(function (node) {
+        node.classList.remove('vortex-enhanced-chrome-hidden');
+      });
+      if (isTranslationFilterDismissedBrowse()) {
+        ensureDismissedBrowseChromeSafe();
+      }
+      return;
+    }
+    if (isTranslationFilterDismissedBrowse()) {
+      applyDismissedBrowseHideChrome(config);
+      return;
+    }
+    document.documentElement.classList.add('vortex-enhanced-hide-chrome');
+    layoutNexusActiveFiltersInline();
+    revealActiveFilterUiForCurrentUrl();
+    hideNexusSiteBannerChrome();
+    hideNexusChromeAboveGrid();
+    hideNexusGameBannerStrip();
+    hideMainColumnHeroAboveCarousel();
+    protectBrowseControlsFromChromeHide();
+    ensureChromeHideWatchdog(config);
+  }
+
+  function ensureHideSiteChrome(config) {
+    applyHideSiteChrome(config);
+  }
+
+  function scheduleChromeHideRefresh() {
+    if (isNexusAuthPage()) {
+      return;
+    }
+    if (!enhancer.config || !enhancer.config.hideSiteChrome) {
+      return;
+    }
+    if (enhancer.chromeHideDebounceTimer) {
+      return;
+    }
+    enhancer.chromeHideDebounceTimer = setTimeout(function () {
+      enhancer.chromeHideDebounceTimer = null;
+      if (enhancer.config && enhancer.config.hideSiteChrome && !isBrowseEnhancementPaused()) {
+        if (isTranslationFilterDismissedBrowse()) {
+          applyDismissedBrowseHideChrome(enhancer.config);
+        } else {
+          hideNexusChromeAboveGrid();
+          hideNexusGameBannerStrip();
+          protectBrowseControlsFromChromeHide();
+        }
+      }
+    }, 80);
+  }
+
+  function ensureChromeHideWatchdog(config) {
+    if (!config || !config.hideSiteChrome) {
+      stopChromeHideWatchdog();
+      return;
+    }
+    if (enhancer.chromeHideWatchdogTimer) {
+      return;
+    }
+    enhancer.chromeHideWatchdogTimer = setInterval(function () {
+      if (!enhancer.config || !enhancer.config.hideSiteChrome || isBrowseEnhancementPaused()) {
+        return;
+      }
+      if (!isBrowseModsListPathname(getBrowsePathname())) {
+        return;
+      }
+      if (!document.querySelector('.vortex-enhanced-carousel-host') && !findModGrid()) {
+        return;
+      }
+      if (isUserInteractingWithNexusFilters()) {
+        hideNexusSiteBannerChrome();
+        hideMainColumnHeroAboveCarousel();
+        hideNexusGameBannerStrip();
+        protectBrowseControlsFromChromeHide();
+        ensureNexusFiltersPanelStayOpen();
+        return;
+      }
+      if (isTranslationFilterDismissedBrowse()) {
+        applyDismissedBrowseHideChrome(enhancer.config);
+        return;
+      }
+      hideNexusChromeAboveGrid();
+      hideNexusGameBannerStrip();
+      protectBrowseControlsFromChromeHide();
+    }, 1500);
+  }
+
+  function stopChromeHideWatchdog() {
+    if (enhancer.chromeHideWatchdogTimer) {
+      clearInterval(enhancer.chromeHideWatchdogTimer);
+      enhancer.chromeHideWatchdogTimer = null;
+    }
+    if (enhancer.chromeHideDebounceTimer) {
+      clearTimeout(enhancer.chromeHideDebounceTimer);
+      enhancer.chromeHideDebounceTimer = null;
+    }
+  }
+
+  function hideNexusChromeAboveGrid() {
+    if (isTranslationFilterDismissedBrowse()) {
+      applyDismissedBrowseHideChrome(enhancer.config || {});
+      return;
+    }
+    var host = document.querySelector('.vortex-enhanced-carousel-host') || findModGrid();
+    if (!host) {
+      hideNexusGameBannerStrip(null);
+      return;
+    }
+
+    host.classList.remove('vortex-enhanced-chrome-hidden');
+
+    var selectors = [
+      'header',
+      'footer',
+      'aside',
+      '#filters-panel',
+      '#siteHeader',
+      '#site-header',
+      '[class*="GlobalHeader"]',
+      '[class*="GlobalNav"]',
+      '[class*="SiteHeader"]',
+      '[class*="site-footer"]',
+      '[class*="ResultsHeader"]',
+      '[class*="Breadcrumbs"]',
+      '[class*="GameHeader"]',
+      '[class*="PageHero"]',
+      '[class*="HeroBanner"]',
+      '[class*="CoverBanner"]',
+      '[class*="ModsHeader"]',
+      '[class*="GameBanner"]',
+    ];
+    selectors.forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        if (nodeHasVortexEnhancedUi(node) ||
+            (node.classList && node.classList.contains('vortex-enhanced-results-toolbar'))) {
+          node.classList.remove('vortex-enhanced-chrome-hidden');
+          return;
+        }
+        if (isInMainBrowseColumn(node, { ignoreVisibility: true })) {
+          if (shouldPreserveMainColumnBrowseChrome(node)) {
+            node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+            return;
+          }
+          if (!host.contains(node) && !node.contains(host)) {
+            markNodeChromeHidden(node);
+          }
+          return;
+        }
+        if (!host.contains(node) && !node.contains(host)) {
+          if (selector === 'aside' || selector === '#filters-panel') {
+            if (isNexusFiltersPanelOpen() ||
+                enhancer.userWantsNexusFiltersOpen ||
+                node.classList.contains('vortex-enhanced-nexus-filters-open')) {
+              markNexusFiltersPanelOpen(true);
+              node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
+              if (node.style) {
+                node.style.removeProperty('display');
+              }
+              return;
+            }
+            node.classList.add('vortex-enhanced-chrome-hidden');
+            return;
+          }
+          if (selector.indexOf('ResultsHeader') >= 0) {
+            if (rowLooksLikeResultsToolbarContainer(node) || rowHasSortControls(node)) {
+              node.classList.remove(
+                'vortex-enhanced-chrome-hidden',
+                'vortex-enhanced-browse-trim-hidden',
+                'vortex-enhanced-nexus-active-filters-empty',
+                'vortex-enhanced-browse-gap-collapse'
+              );
+              unhideBrowseContentChain(node);
+              return;
+            }
+            if (browseUrlHasRemovableActiveFilters() &&
+                rowHasVisibleActiveFilterChips(node) &&
+                (rowLooksLikeNexusActiveFilters(node) || shouldPreserveActiveFilterRow(node))) {
+              node.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-nexus-active-filters-empty', 'vortex-enhanced-browse-gap-collapse');
+              node.classList.add('vortex-enhanced-nexus-active-filters');
+              ensureActiveFilterRowVisible(node);
+              return;
+            }
+          }
+          node.classList.add('vortex-enhanced-chrome-hidden');
+        }
+      });
+    });
+
+    hideChromeSiblingsAroundHost(host);
+    hideNexusGameBannerStrip(host);
+    hideMainColumnHeroAboveCarousel();
+    protectBrowseControlsFromChromeHide();
+    hideNexusItemsPerPageUi();
   }
 
   function tagNexusPaginationNav() {
@@ -7664,11 +17064,19 @@
   }
 
   function ensureTranslationFilterWatchdog() {
+    if (enhancer.userDismissedTranslationFilter) {
+      return;
+    }
     if (enhancer.translationFilterWatchdog) {
       return;
     }
 
     enhancer.translationFilterWatchdog = setInterval(function () {
+      if (enhancer.userDismissedTranslationFilter) {
+        clearInterval(enhancer.translationFilterWatchdog);
+        enhancer.translationFilterWatchdog = null;
+        return;
+      }
       if (isCarouselQuietPeriod()) {
         return;
       }
@@ -7687,9 +17095,22 @@
     }, 4000);
   }
 
-  // IMPERATIVE (user requirement — do not disable): hide translations ON by default.
-  // See AGENTS.md "Hide translations — IMPERATIVE". Client + Nexus filters must stay active.
+  // Hide translations ON by default for fresh browse sessions; user chip/clear-all dismiss opts out.
   function applyDefaultNexusFilters(config) {
+    if (enhancer.userDismissedTranslationFilter) {
+      return;
+    }
+
+    if (translationFilterExcludedInUrl()) {
+      enhancer.clientHideTranslations = true;
+      enhancer.preferHideTranslations = true;
+      enhancer.hideTranslationsApplied = true;
+      enhancer.defaultFiltersApplied = true;
+      enhancer.translationUrlApplied = true;
+      enhancer.translationUrlPending = false;
+      return;
+    }
+
     enhancer.clientHideTranslations = true;
     enhancer.preferHideTranslations = true;
     enhancer.forceDefaultFilters = true;
@@ -7749,7 +17170,9 @@
     if (setHideTranslationsControl(input, true)) {
       enhancer.defaultFiltersApplied = true;
       enhancer.filtersOpenAttempts = 0;
-      closeNexusFiltersPanel();
+      if (!isNexusFiltersPanelVisible() && !enhancer.userWantsNexusFiltersOpen) {
+        closeNexusFiltersPanel();
+      }
       setTimeout(function () {
         enhancer.scheduleScan(true);
       }, 350);
@@ -7768,7 +17191,9 @@
       if (isNexusHideTranslationsActive()) {
         enhancer.defaultFiltersApplied = true;
         enhancer.filtersOpenAttempts = 0;
-        closeNexusFiltersPanel();
+        if (!isNexusFiltersPanelVisible() && !enhancer.userWantsNexusFiltersOpen) {
+          closeNexusFiltersPanel();
+        }
         setTimeout(function () {
           enhancer.scheduleScan(true);
         }, 350);
@@ -8063,8 +17488,12 @@
       '  position: sticky !important;',
       '  top: 0 !important;',
       '  z-index: 40 !important;',
+      '  pointer-events: none !important;',
       '  background: #101010 !important;',
       '  border-bottom: 1px solid rgba(255,255,255,0.08) !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-controls-bar-in-host > * {',
+      '  pointer-events: auto !important;',
       '}',
       'html.vortex-enhanced-hide-chrome .vortex-enhanced-carousel-host > .vortex-enhanced-grid-layout {',
       '  flex: 1 1 auto !important;',
@@ -8096,8 +17525,10 @@
       '  overflow: hidden !important;',
       '  box-sizing: border-box !important;',
       '}',
-      '.vortex-enhanced-grid-layout > [data-e2eid="mod-tile"].vortex-enhanced-carousel-hidden,',
-      '.vortex-enhanced-grid-layout > [data-e2eid="mod-tile"].vortex-enhanced-hidden {',
+      '.vortex-enhanced-grid-layout [data-e2eid="mod-tile"].vortex-enhanced-carousel-hidden,',
+      '.vortex-enhanced-grid-layout [data-e2eid="mod-tile"].vortex-enhanced-hidden,',
+      'main [data-e2eid="mod-tile"].vortex-enhanced-carousel-hidden,',
+      '#mainContent [data-e2eid="mod-tile"].vortex-enhanced-carousel-hidden {',
       '  display: none !important;',
       '}',
       '.vortex-enhanced-grid-layout [data-e2eid="mod-tile"] > a[href*="/mods/"]:first-of-type {',
@@ -8266,6 +17697,19 @@
       '  max-width: 100% !important;',
       '  box-sizing: border-box !important;',
       '}',
+      '.vortex-enhanced-filter-toolbar-row {',
+      '  display: flex !important;',
+      '  flex-direction: row !important;',
+      '  align-items: center !important;',
+      '  flex-wrap: wrap !important;',
+      '  gap: 8px !important;',
+      '  width: 100% !important;',
+      '  box-sizing: border-box !important;',
+      '}',
+      '.vortex-enhanced-filter-toolbar-row > .vortex-enhanced-controls-anchor {',
+      '  margin-left: auto !important;',
+      '  flex: 0 0 auto !important;',
+      '}',
       '.vortex-enhanced-unified-toolbar-row > .vortex-enhanced-controls-anchor {',
       '  margin-left: auto !important;',
       '  flex: 0 0 auto !important;',
@@ -8285,6 +17729,9 @@
       '  flex-wrap: nowrap !important;',
       '  padding: 0 !important;',
       '  margin-bottom: 0 !important;',
+      '}',
+      '.vortex-enhanced-hide-native-count {',
+      '  display: none !important;',
       '}',
       '.vortex-enhanced-carousel-controls {',
       '  display: flex !important;',
@@ -8345,14 +17792,15 @@
       'html.vortex-enhanced-hide-chrome footer,',
       'html.vortex-enhanced-hide-chrome #siteHeader,',
       'html.vortex-enhanced-hide-chrome #site-header,',
-      'html.vortex-enhanced-hide-chrome aside:not(.vortex-enhanced-nexus-filters-open),',
-      'html.vortex-enhanced-hide-chrome #filters-panel:not(.vortex-enhanced-nexus-filters-open),',
+      'html.vortex-enhanced-hide-chrome:not(.vortex-enhanced-translation-dismissed) aside:not(.vortex-enhanced-nexus-filters-open),',
+      'html.vortex-enhanced-hide-chrome:not(.vortex-enhanced-translation-dismissed) #filters-panel:not(.vortex-enhanced-nexus-filters-open),',
       'html.vortex-enhanced-hide-chrome [class*="site-footer"],',
       'html.vortex-enhanced-hide-chrome [class*="GlobalHeader"],',
       'html.vortex-enhanced-hide-chrome [class*="GlobalNav"],',
       'html.vortex-enhanced-hide-chrome [class*="SiteHeader"],',
-      'html.vortex-enhanced-hide-chrome [class*="ModsToolbar"],',
-      'html.vortex-enhanced-hide-chrome [class*="ResultsHeader"],',
+      'html.vortex-enhanced-hide-chrome:not(.vortex-enhanced-translation-dismissed) [class*="ResultsHeader"]:not(:has(.vortex-enhanced-nexus-active-filters)):not(:has(.vortex-enhanced-sort-toolbar-row)):not(:has(.vortex-enhanced-unified-toolbar-row)):not(:has([class*="ActiveFilter"])):not(:has([class*="AppliedFilter"])),',
+      'html.vortex-enhanced-hide-chrome [class*="ActiveFilter"]:not(.vortex-enhanced-nexus-active-filters):not(:has(.vortex-enhanced-nexus-active-filters)),',
+      'html.vortex-enhanced-hide-chrome [class*="AppliedFilter"]:not(.vortex-enhanced-nexus-active-filters):not(:has(.vortex-enhanced-nexus-active-filters)),',
       'html.vortex-enhanced-hide-chrome [class*="Breadcrumbs"],',
       'html.vortex-enhanced-hide-chrome [class*="GameHeader"],',
       'html.vortex-enhanced-hide-chrome [class*="PageHero"],',
@@ -8363,6 +17811,68 @@
       'html.vortex-enhanced-hide-chrome .vortex-enhanced-chrome-hidden {',
       '  display: none !important;',
       '}',
+      'html.vortex-enhanced-auth-page input,',
+      'html.vortex-enhanced-auth-page textarea,',
+      'html.vortex-enhanced-auth-page select,',
+      'html.vortex-enhanced-auth-page form,',
+      'html.vortex-enhanced-auth-page main,',
+      'html.vortex-enhanced-auth-page label,',
+      'html.vortex-enhanced-auth-page button {',
+      '  display: revert !important;',
+      '  visibility: visible !important;',
+      '  opacity: 1 !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome #filters-panel.vortex-enhanced-nexus-filters-open,',
+      'html.vortex-enhanced-hide-chrome aside.vortex-enhanced-nexus-filters-open,',
+      'html.vortex-enhanced-hide-chrome #filters-panel.vortex-enhanced-nexus-filters-open.vortex-enhanced-chrome-hidden,',
+      'html.vortex-enhanced-hide-chrome aside.vortex-enhanced-nexus-filters-open.vortex-enhanced-chrome-hidden {',
+      '  display: block !important;',
+      '  visibility: visible !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome [class*="ResultsHeader"],',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-results-toolbar,',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-carousel-host,',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-nexus-grid,',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome [data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-nexus-live-hidden),',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome nav:has([aria-current="page"]):not(.vortex-enhanced-nexus-pagination-hide) {',
+      '  visibility: visible !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome [class*="ResultsHeader"],',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-results-toolbar,',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-sort-toolbar-row,',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-unified-toolbar-row {',
+      '  display: flex !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome .vortex-enhanced-nexus-grid {',
+      '  display: grid !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed.vortex-enhanced-hide-chrome [data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-nexus-live-hidden) {',
+      '  display: block !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) [class*="ResultsHeader"],',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-results-toolbar,',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-carousel-host,',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-nexus-grid,',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) [data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-nexus-live-hidden),',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) nav:has([aria-current="page"]):not(.vortex-enhanced-nexus-pagination-hide) {',
+      '  visibility: visible !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) [class*="ResultsHeader"],',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-results-toolbar,',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-sort-toolbar-row,',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-unified-toolbar-row {',
+      '  display: flex !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) .vortex-enhanced-nexus-grid {',
+      '  display: grid !important;',
+      '}',
+      'html.vortex-enhanced-translation-dismissed:not(.vortex-enhanced-hide-chrome) [data-e2eid="mod-tile"]:not(.vortex-enhanced-carousel-hidden):not(.vortex-enhanced-nexus-live-hidden) {',
+      '  display: block !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-nexus-active-filters,',
+      'html.vortex-enhanced-hide-chrome [class*="ResultsHeader"]:has(.vortex-enhanced-nexus-active-filters),',
+      'html.vortex-enhanced-hide-chrome [class*="ActiveFilter"].vortex-enhanced-nexus-active-filters,',
+      'html.vortex-enhanced-hide-chrome [class*="AppliedFilter"].vortex-enhanced-nexus-active-filters,',
       'html.vortex-enhanced-hide-chrome .vortex-enhanced-unified-toolbar-row,',
       'html.vortex-enhanced-hide-chrome .vortex-enhanced-results-toolbar,',
       'html.vortex-enhanced-hide-chrome .vortex-enhanced-sort-toolbar-row,',
@@ -8407,6 +17917,17 @@
       '.vortex-enhanced-nexus-pagination-hide {',
       '  display: none !important;',
       '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-items-per-page-hide,',
+      'html.vortex-enhanced-hide-chrome button[aria-label="Mods per page"] {',
+      '  display: none !important;',
+      '  visibility: hidden !important;',
+      '  width: 0 !important;',
+      '  min-width: 0 !important;',
+      '  padding: 0 !important;',
+      '  margin: 0 !important;',
+      '  overflow: hidden !important;',
+      '  pointer-events: none !important;',
+      '}',
       '.vortex-enhanced-filter-panel {',
       '  margin: 0 0 12px 0;',
       '  padding: 0;',
@@ -8418,6 +17939,130 @@
       '  clear: both;',
       '  display: block;',
       '  box-sizing: border-box;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-filter-panel-inline {',
+      '  display: none !important;',
+      '}',
+      '.vortex-enhanced-nexus-active-filters {',
+      '  display: flex !important;',
+      '  flex-direction: row !important;',
+      '  flex-wrap: wrap !important;',
+      '  align-items: center !important;',
+      '  gap: 8px !important;',
+      '  margin: 0 !important;',
+      '  padding: 0 !important;',
+      '  min-height: 28px !important;',
+      '  height: auto !important;',
+      '  line-height: 1.2 !important;',
+      '  position: relative !important;',
+      '  z-index: 45 !important;',
+      '  pointer-events: auto !important;',
+      '  flex: 0 0 100% !important;',
+      '  width: 100% !important;',
+      '  max-width: 100% !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-unified-toolbar-row:has(.vortex-enhanced-nexus-active-filters),',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-sort-toolbar-row:has(.vortex-enhanced-nexus-active-filters) {',
+      '  flex-wrap: wrap !important;',
+      '}',
+      '.vortex-enhanced-nexus-active-filters > :not(button):not(a):not([role="button"]) {',
+      '  margin: 0 !important;',
+      '  padding-top: 0 !important;',
+      '  padding-bottom: 0 !important;',
+      '  min-height: 0 !important;',
+      '  line-height: 1.2 !important;',
+      '}',
+      '.vortex-enhanced-nexus-active-filters button,',
+      '.vortex-enhanced-nexus-active-filters a,',
+      '.vortex-enhanced-nexus-active-filters [role="button"],',
+      '.vortex-enhanced-nexus-clear-all {',
+      '  position: relative !important;',
+      '  z-index: 46 !important;',
+      '  pointer-events: auto !important;',
+      '  cursor: pointer !important;',
+      '  min-height: 24px !important;',
+      '  touch-action: manipulation !important;',
+      '}',
+      '.vortex-enhanced-nexus-active-filters-shell,',
+      '[class*="ResultsHeader"]:has(.vortex-enhanced-nexus-active-filters) {',
+      '  margin-top: 0 !important;',
+      '  margin-bottom: 0 !important;',
+      '  padding-top: 0 !important;',
+      '  padding-bottom: 0 !important;',
+      '  min-height: 0 !important;',
+      '  height: auto !important;',
+      '  gap: 0 !important;',
+      '  position: relative !important;',
+      '  z-index: 44 !important;',
+      '  pointer-events: auto !important;',
+      '}',
+      '.vortex-enhanced-nexus-active-filters-empty,',
+      '.vortex-enhanced-browse-gap-collapse,',
+      '.vortex-enhanced-nexus-active-filters.vortex-enhanced-browse-gap-collapse,',
+      '[class*="ActiveFilter"].vortex-enhanced-browse-gap-collapse,',
+      '[class*="AppliedFilter"].vortex-enhanced-browse-gap-collapse,',
+      '.vortex-enhanced-nexus-active-filters-shell.vortex-enhanced-browse-gap-collapse {',
+      '  display: none !important;',
+      '  visibility: hidden !important;',
+      '  height: 0 !important;',
+      '  min-height: 0 !important;',
+      '  max-height: 0 !important;',
+      '  margin: 0 !important;',
+      '  padding: 0 !important;',
+      '  overflow: hidden !important;',
+      '  border: 0 !important;',
+      '  flex: 0 0 0 !important;',
+      '  line-height: 0 !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-unified-toolbar-row:not(.vortex-enhanced-has-active-filters) > .vortex-enhanced-browse-gap-collapse,',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-sort-toolbar-row:not(.vortex-enhanced-has-active-filters) > .vortex-enhanced-browse-gap-collapse {',
+      '  display: none !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-carousel-host {',
+      '  margin-top: 0 !important;',
+      '  padding-top: 0 !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-carousel-host > .vortex-enhanced-grid-layout {',
+      '  margin-top: 0 !important;',
+      '  padding-top: 0 !important;',
+      '}',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-unified-toolbar-row:not(.vortex-enhanced-has-active-filters),',
+      'html.vortex-enhanced-hide-chrome .vortex-enhanced-sort-toolbar-row:not(.vortex-enhanced-has-active-filters) {',
+      '  flex-wrap: nowrap !important;',
+      '  row-gap: 0 !important;',
+      '  margin-bottom: 0 !important;',
+      '  padding-bottom: 0 !important;',
+      '}',
+      'html.vortex-enhanced-no-url-filters .vortex-enhanced-unified-toolbar-row:not(.vortex-enhanced-has-active-filters),',
+      'html.vortex-enhanced-no-url-filters .vortex-enhanced-sort-toolbar-row:not(.vortex-enhanced-has-active-filters) {',
+      '  flex-wrap: nowrap !important;',
+      '  row-gap: 0 !important;',
+      '  margin-bottom: 0 !important;',
+      '  padding-bottom: 0 !important;',
+      '}',
+      'html.vortex-enhanced-no-url-filters .vortex-enhanced-unified-toolbar-row:not(.vortex-enhanced-has-active-filters) > .vortex-enhanced-browse-gap-collapse,',
+      'html.vortex-enhanced-no-url-filters .vortex-enhanced-sort-toolbar-row:not(.vortex-enhanced-has-active-filters) > .vortex-enhanced-browse-gap-collapse {',
+      '  display: none !important;',
+      '}',
+      'html.vortex-enhanced-no-url-filters .vortex-enhanced-carousel-host {',
+      '  margin-top: 0 !important;',
+      '  padding-top: 0 !important;',
+      '  transform: translateY(-18px) !important;',
+      '}',
+      '.vortex-enhanced-nexus-clear-all {',
+      '  display: inline !important;',
+      '  margin: 0 !important;',
+      '  padding: 0 !important;',
+      '  white-space: nowrap !important;',
+      '}',
+      '[data-vortex-enhanced-filters="true"] {',
+      '  display: block !important;',
+      '  visibility: visible !important;',
+      '}',
+      'aside.vortex-enhanced-nexus-filters-open [data-vortex-enhanced-filters="true"],',
+      '#filters-panel.vortex-enhanced-nexus-filters-open [data-vortex-enhanced-filters="true"] {',
+      '  display: block !important;',
+      '  visibility: visible !important;',
       '}',
       '.vortex-enhanced-filter-panel-aside {',
       '  width: 100%;',
@@ -8948,12 +18593,29 @@
     if (!enhancer.pendingFooterTargets) {
       enhancer.pendingFooterTargets = {};
     }
+    if (!enhancer.pendingFooterActionTimers) {
+      enhancer.pendingFooterActionTimers = {};
+    }
     var key = action + ':' + modId;
+    if (enhancer.pendingFooterActionTimers[key]) {
+      clearTimeout(enhancer.pendingFooterActionTimers[key]);
+      enhancer.pendingFooterActionTimers[key] = null;
+    }
     if (pending) {
       enhancer.pendingFooterActions[key] = true;
       if (typeof targetState === 'boolean') {
         enhancer.pendingFooterTargets[key] = targetState;
       }
+      enhancer.pendingFooterActionTimers[key] = setTimeout(function () {
+        enhancer.pendingFooterActionTimers[key] = null;
+        if (!isFooterActionPending(action, modId)) {
+          return;
+        }
+        setFooterActionPending(action, modId, false);
+        if (window.__vortexBrowseEnhancer) {
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        }
+      }, 12000);
     } else {
       delete enhancer.pendingFooterActions[key];
       delete enhancer.pendingFooterTargets[key];
@@ -9216,25 +18878,30 @@
       return existing;
     }
 
-    var category = card.querySelector('[data-e2eid="mod-tile-category"]');
-    if (!category) {
-      return null;
-    }
-
     var row = document.createElement('div');
     row.className = 'vortex-enhanced-install-row';
 
-    var categoryBlock = category.closest('div.py-2') || category.parentElement;
-    if (categoryBlock && categoryBlock.parentElement) {
-      if (categoryBlock.nextSibling) {
-        categoryBlock.parentElement.insertBefore(row, categoryBlock.nextSibling);
-      } else {
-        categoryBlock.parentElement.appendChild(row);
+    var category = card.querySelector('[data-e2eid="mod-tile-category"]');
+    if (category) {
+      var categoryBlock = category.closest('div.py-2') || category.parentElement;
+      if (categoryBlock && categoryBlock.parentElement) {
+        if (categoryBlock.nextSibling) {
+          categoryBlock.parentElement.insertBefore(row, categoryBlock.nextSibling);
+        } else {
+          categoryBlock.parentElement.appendChild(row);
+        }
+        return row;
       }
+    }
+
+    var footer = findTileFooter(card);
+    if (footer && footer.parentElement) {
+      footer.parentElement.insertBefore(row, footer);
       return row;
     }
 
-    return null;
+    card.appendChild(row);
+    return row;
   }
 
   function syncDependencyBadge(card, modId, config, actionsRow) {
@@ -9379,6 +19046,7 @@
     if (!card) {
       return false;
     }
+    config = config || enhancer.config || {};
 
     var isInstalled = !!installedEntry;
     if (config.onlyInstalled && !isInstalled) {
@@ -9393,7 +19061,7 @@
     if (config.hideTracked && isTracked) {
       return true;
     }
-    if ((enhancer.hideTranslationsApplied || enhancer.clientHideTranslations) && isTranslationModCard(card)) {
+    if (shouldFilterTranslationsClientSide() && isTranslationModCard(card)) {
       return true;
     }
     return false;
@@ -9413,15 +19081,22 @@
     if (config && config.onlyTracked && enhancer.trackedCatalogActive && isTrackedCatalogReady(config)) {
       return;
     }
-    var selectors = [
-      '.vortex-enhanced-grid-layout [data-e2eid="mod-tile"]',
-      '#vortex-enhanced-live-stash [data-e2eid="mod-tile"]',
-      '#vortex-enhanced-pool-host [data-e2eid="mod-tile"]',
-    ];
     var seen = {};
+    var grid = findNexusModGrid();
+    var tileNodes = [];
 
-    selectors.forEach(function (selector) {
-      document.querySelectorAll(selector).forEach(function (card) {
+    if (grid) {
+      tileNodes = Array.prototype.slice.call(grid.querySelectorAll('[data-e2eid="mod-tile"]'));
+    }
+    ['#vortex-enhanced-live-stash [data-e2eid="mod-tile"]', '#vortex-enhanced-pool-host [data-e2eid="mod-tile"]'].forEach(function (selector) {
+      document.querySelectorAll(selector).forEach(function (node) {
+        if (tileNodes.indexOf(node) < 0) {
+          tileNodes.push(node);
+        }
+      });
+    });
+
+    tileNodes.forEach(function (card) {
         if (seen[card]) {
           return;
         }
@@ -9435,18 +19110,37 @@
         if (shouldHideTileCard(card, config, installedEntry, isTracked)) {
           card.classList.add('vortex-enhanced-hidden');
         }
-      });
     });
   }
 
+  function queryLiveGridModTiles(grid, options) {
+    options = options || {};
+    if (!grid) {
+      return [];
+    }
+    var poolFilter = options.includePoolTiles ? '' : ':not([data-vortex-pool-tile])';
+    var selector = '[data-e2eid="mod-tile"]' + poolFilter;
+    var minDirect = typeof options.minDirect === 'number' ? options.minDirect : 1;
+    var direct = grid.querySelectorAll(':scope > ' + selector);
+    if (direct.length >= minDirect) {
+      return Array.prototype.slice.call(direct);
+    }
+    return Array.prototype.slice.call(grid.querySelectorAll(selector));
+  }
+
   function collectLiveGridCards(config) {
+    config = config || enhancer.config || { installed: {}, tracked: {} };
+    if (!config.installed) {
+      config.installed = {};
+    }
+    if (!config.tracked) {
+      config.tracked = {};
+    }
     var grid = resolveNexusModGridElement();
     var tileNodes = [];
 
     if (grid) {
-      tileNodes = Array.prototype.slice.call(
-        grid.querySelectorAll(':scope > [data-e2eid="mod-tile"]:not([data-vortex-pool-tile])')
-      );
+      tileNodes = queryLiveGridModTiles(grid, { minDirect: 4 });
     }
 
     var stash = document.getElementById('vortex-enhanced-live-stash');
@@ -9634,8 +19328,12 @@
     syncAutoAdvance();
     scheduleControlsRemount();
     if (config.hideSiteChrome) {
-      hideNexusChromeAboveGrid();
-      hideNexusGameBannerStrip();
+      if (isTranslationFilterDismissedBrowse()) {
+        applyDismissedBrowseHideChrome(config);
+      } else {
+        hideNexusChromeAboveGrid();
+        hideNexusGameBannerStrip();
+      }
     }
 
     requestAnimationFrame(function () {
@@ -9659,7 +19357,7 @@
         // ignore
       }
     }
-    return stats;
+    return attachHostLogs(stats, config);
   }
 
   function collectCards(config) {
@@ -9679,6 +19377,10 @@
     }
 
     var live = collectLiveGridCards(config);
+    if ((urlHasActiveNexusFilters() || hasNumericNexusBrowseFilters()) &&
+        filteredBrowseUsesLiveCatalogOnly()) {
+      return live;
+    }
     if (!enhancer.tilePool || enhancer.tilePool.length === 0) {
       return live;
     }
@@ -9741,20 +19443,81 @@
     };
   }
 
+  function browseNeedsEnhancementRecovery(config) {
+    if (!config || !config.hideSiteChrome) {
+      return false;
+    }
+    if (!isBrowseModsListPathname(getBrowsePathname())) {
+      return false;
+    }
+    var tiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+    if (tiles < 4) {
+      return false;
+    }
+    if (!document.querySelector('.vortex-enhanced-carousel-host')) {
+      return true;
+    }
+    return gridVisibleTilesNeedDecoration(config);
+  }
+
+  function recoverBrowseEnhancementIfNeeded(config) {
+    if (!browseNeedsEnhancementRecovery(config)) {
+      return false;
+    }
+    clearCarouselQuietPeriod();
+    enhancer.enhancementFullyPaused = false;
+    enhancer.pendingPoolCleanup = false;
+    return true;
+  }
+
+  function runNumericFilteredBrowseScanPath(config) {
+    if (hasNumericNexusBrowseFilters() ||
+        hasVisibleNexusFilterChipText() ||
+        (config && config.filterBrowseActive && urlHasActiveNexusFilters())) {
+      enhancer.filteredBrowseEngaged = true;
+      enhancer.domFilterBrowseActive = true;
+      syncFilteredBrowseDocumentState();
+    }
+    var numericEarlyStats = executeMinimalNumericFilteredBrowseScan(config);
+    logToHost('scanNumericFilteredBrowse early', {
+      stats: numericEarlyStats,
+      liveTiles: numericEarlyStats.tileCount || 0,
+      minimal: true,
+    });
+    return attachHostLogs(numericEarlyStats, config);
+  }
+
   function scan(config) {
-    if (recoverFromBrowseOopsIfNeeded()) {
-      return enhancer.lastStats || emptyScanStats(config);
+    if (enhancer.scanInProgress) {
+      return attachHostLogs(enhancer.lastStats || emptyScanStats(config), config);
+    }
+    config = config || enhancer.config || {};
+    if (config.filterBrowseActive && urlHasMeaningfulNexusFilters()) {
+      enhancer.domFilterBrowseActive = true;
+      enhancer.filteredBrowseEngaged = true;
+    }
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return attachHostLogs(runNumericFilteredBrowseScanPath(config), config);
+    }
+    enhancer.scanInProgress = true;
+    try {
+    var pathname = getBrowsePathname();
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return runNumericFilteredBrowseScanPath(config);
     }
 
-    if (enhancer.nexusFilterApplyInFlight && !isBrowseOopsPage()) {
-      return enhancer.lastStats || emptyScanStats(config);
+    if (recoverFromBrowseOopsIfNeeded()) {
+      return attachHostLogs(enhancer.lastStats || emptyScanStats(config), config);
     }
+
+    var filterApplyInFlight = enhancer.nexusFilterApplyInFlight && !isBrowseOopsPage();
+    var needsRecovery = recoverBrowseEnhancementIfNeeded(config);
 
     if (isBrowseEnhancementPaused()) {
       return enhancer.lastStats || emptyScanStats(config);
     }
 
-    if (enhancer.enhancementFullyPaused && !isBrowseOopsPage()) {
+    if (enhancer.enhancementFullyPaused && !isBrowseOopsPage() && !needsRecovery) {
       return enhancer.lastStats || emptyScanStats(config);
     }
 
@@ -9762,7 +19525,20 @@
       return enhancer.lastStats || emptyScanStats(config);
     }
 
-    var pathname = getBrowsePathname();
+    refreshDomFilteredBrowseState();
+    if (shouldUseNumericFilteredBrowseScan(config)) {
+      return runNumericFilteredBrowseScanPath(config);
+    }
+    if (!config.onlyTracked && !config.onlyInstalled && !isLocalCatalogMode(config) &&
+        isBrowseModsListPathname(pathname) &&
+        shouldUseFilteredBrowseLightScan(config)) {
+      clearStaleFilteredBrowseFetchLocks();
+      if (enhancer.filteredBrowseHostBatchInFlight && enhancer.filteredBrowseHostBatchPhase !== 'forward') {
+        finishFilteredBrowseHostBatch(false);
+      }
+      var shortCircuitStats = executeFilteredBrowseLightScan(config, { nested: true });
+      return attachHostLogs(shortCircuitStats, config);
+    }
     if (!isBrowseModsListPathname(pathname)) {
       if (isBrowseModDetailPathname(pathname) || pathname.indexOf('/mods') >= 0) {
         enterBrowseDetailHandsOffMode();
@@ -9774,28 +19550,76 @@
       exitBrowseDetailHandsOffMode();
     }
 
+    if (shouldTakeFilteredBrowseFastPath(config)) {
+      return runFilteredBrowseFastScan(config);
+    }
+
     var scrollY = window.scrollY || 0;
     if (typeof enhancer.savedListScrollY === 'number' && enhancer.savedListScrollY >= 0) {
       scrollY = enhancer.savedListScrollY;
       enhancer.savedListScrollY = null;
     }
     ensureStyles();
+    restoreMainBrowseContentVisibility();
+    if (isPooledNexusCarouselBrowseMode(config) && isDismissedCarouselBrowseMode(config)) {
+      prepareDismissedCarouselBrowse(config);
+    }
+    clearTranslationDismissNavigationPendingIfReady();
+    if (isTranslationFilterDismissedBrowse()) {
+      prepareDismissedCarouselBrowse(config);
+    } else {
+      syncBrowseUrlFilterDocumentState();
+      if (!browseUrlHasRemovableActiveFilters()) {
+        hideOrphanedClearAllRows();
+        if (!shouldDeferDismissLayoutCollapse()) {
+          collapseFilterGapBetweenToolbarAndGrid();
+        }
+      }
+    }
 
     var sessionKey = getBrowseSessionKey();
     var browsePath = getBrowsePathname();
+    noteBrowseGameContext(browsePath);
     if (sessionKey !== enhancer.poolSessionKey && enhancer.poolSessionKey) {
-      resetGlobalPagingSoft();
-      resetTranslationFilters();
-      enhancer.lastAppliedSliceKey = '';
-      enhancer.globalPageIndex = 0;
+      var translationOnlySessionChange =
+        translationFilterRemovedBetweenSessionKeys(enhancer.poolSessionKey, sessionKey) ||
+        sessionKeyChangeIsTranslationOnly(enhancer.poolSessionKey, sessionKey);
+      if (translationFilterRemovedBetweenSessionKeys(enhancer.poolSessionKey, sessionKey)) {
+        acknowledgeUserTranslationFilterDismissal('session-scan');
+      } else if (sessionKeyChangeIsTranslationOnly(enhancer.poolSessionKey, sessionKey)) {
+        resetNexusResultsHeadlineCache();
+      }
       enhancer.poolSessionKey = sessionKey;
       enhancer.browsePathname = browsePath;
-      unhideAllCarouselTiles();
-      if (config.onlyTracked || config.onlyInstalled) {
-        ensureLocalCatalogInitialized(config);
+      if (translationOnlySessionChange) {
         enhancer.carouselQuietUntil = 0;
-      } else if (!isCarouselQuietPeriod() && !enhancer.nexusFilterApplyInFlight) {
-        beginCarouselQuietPeriod(1200);
+        enhancer.pendingPoolCleanup = false;
+        enhancer.lastAppliedSliceKey = '';
+        enhancer.tilePool = [];
+        resetNexusResultsHeadlineCache();
+        unhideAllCarouselTiles();
+        syncDismissedFilterBrowseState();
+        enhancer.globalPageIndex = 0;
+        enhancer.batchPageIndex = 0;
+        if (config.hideSiteChrome) {
+          applyDismissedBrowseHideChrome(config);
+        }
+        prepareDismissedCarouselBrowse(config);
+      } else {
+        resetGlobalPagingSoft();
+        resetTranslationFilters();
+        enhancer.lastAppliedSliceKey = '';
+        enhancer.globalPageIndex = 0;
+        unhideAllCarouselTiles();
+        if (config.onlyTracked || config.onlyInstalled) {
+          ensureLocalCatalogInitialized(config);
+          enhancer.carouselQuietUntil = 0;
+        } else if (!isCarouselQuietPeriod() && !enhancer.nexusFilterApplyInFlight &&
+                   !urlHasActiveNexusFilters()) {
+          beginCarouselQuietPeriod(1200);
+        } else if (urlHasActiveNexusFilters()) {
+          resetFilteredBrowseCatalogState();
+        }
       }
     } else if (!enhancer.poolSessionKey) {
       enhancer.poolSessionKey = sessionKey;
@@ -9807,6 +19631,39 @@
 
     if (isBrowseEnhancementPaused()) {
       return enhancer.lastStats || emptyScanStats(config);
+    }
+
+    if (isPooledNexusCarouselBrowseMode(config) && isFilteredBrowseSession(config)) {
+      clearStaleFilteredBrowseFetchLocks();
+      enhancer.nativePoolRestorePromise = null;
+      enhancer.dismissedPoolRestorePromise = null;
+      if (enhancer.filteredBrowseHostBatchInFlight && enhancer.filteredBrowseHostBatchPhase !== 'forward') {
+        finishFilteredBrowseHostBatch(false);
+      }
+      if (hasNumericNexusBrowseFilters()) {
+        var numericStats = executeNumericFilteredBrowseScan(config);
+        logToHost('scanNumericFilteredBrowse done', {
+          stats: numericStats,
+          liveTiles: numericStats.tileCount || 0,
+        });
+        return attachHostLogs(numericStats, config);
+      }
+      logToHost('scan filtered browse path', summarizeFilteredBrowseState(config));
+      var filteredLiveTiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
+      if (shouldUseFilteredBrowseLightScan(config)) {
+        var lightStats = executeFilteredBrowseLightScan(config, { nested: true });
+        logToHost('scanFilteredBrowseLight done', {
+          stats: lightStats,
+          state: summarizeFilteredBrowseState(config),
+        });
+        return attachHostLogs(lightStats, config);
+      }
+      if (filteredLiveTiles > 0 && isCarouselQuietPeriod()) {
+        applyFilteredNexusDirectPage(config, { skipDecorationRetry: true });
+        if (filteredLiveTiles < 8) {
+          return attachHostLogs(scanLightDuringQuiet(config), config);
+        }
+      }
     }
 
     ensureHideSiteChrome(config);
@@ -9821,14 +19678,15 @@
       enhancer.translationUrlApplied = true;
       enhancer.translationUrlPending = false;
     }
-    if (!shouldDeferHeavyNexusUi(config)) {
+    if (enhancer.userDismissedTranslationFilter) {
+      syncHideTranslationsSidebarIfNeeded();
+    }
+    if (!shouldDeferHeavyNexusUi(config) && !filterApplyInFlight) {
       applyDefaultNexusFilters(config);
       ensureTranslationFilterWatchdog();
-      if (!isNexusHideTranslationsActive()) {
-        applyDefaultNexusFilters(config);
-      }
     }
-    if (!isNexusFiltersPanelOpen() && !enhancer.filtersPanelOpenApplied) {
+    if (!isFilteredBrowseSession(config) &&
+        !isNexusFiltersPanelVisible() && !enhancer.filtersPanelOpenApplied) {
       if ((enhancer.hideTranslationsApplied || config.hideSiteChrome) && !urlHasActiveNexusFilters()) {
         if (!enhancer.nexusFilterCooldownUntil || Date.now() >= enhancer.nexusFilterCooldownUntil) {
           hideNexusFilterAside();
@@ -9837,6 +19695,7 @@
     }
     hideNexusItemsPerPageUi();
     tagNexusPaginationNav();
+    protectNexusBrowseHeaderStack();
 
     var gridConfigKey = getGridConfigKey(config);
     var filterConfigKey = getFilterCarouselConfigKey(config);
@@ -9884,9 +19743,14 @@
       return scanLocalCatalog(config, scrollY);
     }
 
-    if (!enhancer.nativePoolRestorePromise && shouldPreferSoftNexusPagination()) {
+    if (!enhancer.nativePoolRestorePromise &&
+        (shouldPreferSoftNexusPagination() || urlHasActiveNexusFilters())) {
       try {
-        if (sessionStorage.getItem(getNativePoolStorageKey())) {
+        var skipFilteredPoolRestore = urlHasActiveNexusFilters();
+        if (skipFilteredPoolRestore && sessionStorage.getItem(getNativePoolStorageKey())) {
+          clearFilteredBrowsePoolSnapshot();
+        }
+        if (!skipFilteredPoolRestore && sessionStorage.getItem(getNativePoolStorageKey())) {
           enhancer.nativePoolRestorePromise = restoreNativePoolSnapshot(config).then(function (restored) {
             enhancer.nativePoolRestorePromise = null;
             if (restored && window.__vortexBrowseEnhancer) {
@@ -9904,15 +19768,45 @@
       return enhancer.lastStats || emptyScanStats(config);
     }
 
+    if (isDismissedCarouselBrowseMode(config) && !urlHasActiveNexusFilters() &&
+        !enhancer.dismissedPoolRestorePromise &&
+        (!enhancer.tilePool || enhancer.tilePool.length === 0)) {
+      try {
+        if (sessionStorage.getItem(getDismissedPoolStorageKey())) {
+          enhancer.dismissedPoolRestorePromise = restoreDismissedBrowsePoolSnapshot(config).then(function (restored) {
+            enhancer.dismissedPoolRestorePromise = null;
+            if (restored && window.__vortexBrowseEnhancer) {
+              window.__vortexBrowseEnhancer.scheduleScan(true);
+            }
+            return restored;
+          });
+          return enhancer.lastStats || emptyScanStats(config);
+        }
+      } catch (errDismissedRestore) {
+        // ignore
+      }
+    }
+    if (enhancer.dismissedPoolRestorePromise) {
+      return enhancer.lastStats || emptyScanStats(config);
+    }
+
     var cards = collectCards(config);
 
-    if (enhancer.pendingNativeCatalogFetch) {
+    if (isPooledNexusCarouselBrowseMode(config) &&
+        clampDismissedCarouselPageToLoadedCatalog(config)) {
+      cards = collectCards(config);
+    }
+
+    if (enhancer.filteredBrowseHostBatchInFlight) {
+      handleFilteredBrowseHostBatchScan(config);
+      cards = collectCards(config);
+    } else if (enhancer.pendingNativeCatalogFetch) {
       var mergedOnScan = mergeLiveGridIntoPool(config);
       var nativePage = getNexusResultsPageFromUrl();
-      if (mergedOnScan > 0 || collectLiveGridCards(config).length >= 8) {
+      if (mergedOnScan > 0) {
         markNativeMergedPage(nativePage);
       }
-      finishNativeNavFetch(mergedOnScan > 0 || collectLiveGridCards(config).length >= 8);
+      finishNativeNavFetch(mergedOnScan > 0);
       cards = collectCards(config);
     }
 
@@ -9977,12 +19871,33 @@
       } else if (!enhancer.trackedCatalogFetchInFlight) {
         applyTrackedCatalogView(config);
       }
+    } else if (isPooledNexusCarouselBrowseMode(config) && isFilteredBrowseSession(config)) {
+      mergeIntoFilteredCarouselCatalog(collectLiveGridCards(config), config);
+      mergeFilteredPoolIntoCarouselCatalog(config);
+      if (!isFilteredBrowsePagingLocked({}) && !enhancer.carouselAdvancePending &&
+          !enhancer.filteredNexusPageNavInFlight) {
+        if (!enhancer.lastAppliedSliceKey || gridVisibleTilesNeedDecoration(config)) {
+          applyFilteredNexusDirectPage(config, {
+            skipDecorationRetry: true,
+            skipHeadlineSync: true,
+          });
+        }
+      }
+      if (hasNumericNexusBrowseFilters()) {
+        scheduleNumericFilteredHeadlineSync();
+      }
     } else {
       applyLiveCarouselPage(cards, config);
       decorateVisibleCarouselSlice(cards, config);
+      if (urlHasActiveNexusFilters()) {
+        decorateVisibleGridTiles(config);
+      }
     }
 
     if (!config.onlyTracked) {
+      if (browseUsesFilteredCatalogPaging()) {
+        ensureFilteredBrowsePoolSeeded(config);
+      }
       maybePrefetchNextBatch(config, cards);
       ensureFilteredCatalogFill(config);
     }
@@ -9993,6 +19908,20 @@
     syncNexusResultsHeadline(config);
     syncAutoAdvance();
     scheduleControlsRemount();
+    if (isFilteredBrowseSession(config)) {
+      if (!(enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil)) {
+        dedupeLiveGridModTiles(config);
+        if (gridVisibleTilesNeedDecoration(config)) {
+          decorateVisibleFilteredCarouselTiles(config);
+        }
+      }
+      logToHost('scan filtered browse complete', {
+        tileCount: cards.length,
+        browseHref: getActiveBrowseHref(),
+        filterBrowseActive: !!(config && config.filterBrowseActive),
+        state: summarizeFilteredBrowseState(config),
+      });
+    }
 
     if (cards.length < getCarouselPageSize(config) && !enhancer.nexusPageSizePending && !enhancer.liveCarouselMode) {
       trySetNexusPageSize(80);
@@ -10010,7 +19939,11 @@
       }
     }
 
-    return {
+    if (urlHasActiveNexusFilters() && cards.length >= getCarouselPageSize(config)) {
+      enhancer.filteredBrowseStableSessionKey = getBrowseSessionKey();
+    }
+
+    return attachHostLogs({
       tileCount: cards.length,
       installedMatches: cards.filter(function (entry) { return !!entry.installed; }).length,
       hideInstalled: !!config.hideInstalled,
@@ -10018,7 +19951,16 @@
       hideTracked: !!config.hideTracked,
       onlyTracked: !!config.onlyTracked,
       installedKeys: Object.keys(config.installed || {}).length,
-    };
+    }, config);
+    } catch (errScanBody) {
+      logErrorToHost('scan failed', {
+        error: String(errScanBody && errScanBody.message || errScanBody),
+        stack: String(errScanBody && errScanBody.stack || ''),
+      });
+      return attachHostLogs(enhancer.lastStats || emptyScanStats(config), config);
+    } finally {
+      enhancer.scanInProgress = false;
+    }
   }
 
   var enhancer = {
@@ -10062,6 +20004,13 @@
     forceDefaultFilters: true,
     translationUrlApplied: false,
     translationUrlPending: false,
+    userDismissedTranslationFilter: false,
+    lastBrowseGameSlug: '',
+    translationDismissGuardTimer: null,
+    translationDismissGuardStartedAt: 0,
+    translationDismissedAt: 0,
+    translationDismissNavPending: false,
+    translationDismissHandsOffUntil: 0,
     carouselQuietUntil: 0,
     carouselQuietTimer: null,
     scanGeneration: 0,
@@ -10092,6 +20041,23 @@
     nativePoolRestorePromise: null,
     nativeNavFetchStartKey: '',
     carouselAdvancePending: false,
+    dismissedBatchPrefetchInFlight: false,
+    dismissedBatchPrefetchDone: false,
+    dismissedPoolRestorePromise: null,
+    dismissedPoolPagingActive: false,
+    dismissedPoolPagingQuietUntil: 0,
+    dismissedPrefetchDebounceTimer: null,
+    filteredBrowseRescanTimer: null,
+    filteredBrowsePoolSessionKey: '',
+    filteredBrowseStableSessionKey: '',
+    filteredBrowsePageOnePooled: false,
+    filteredBrowseHostBatchInFlight: false,
+    filteredBrowseHostBatchPhase: '',
+    filteredBrowseHostBatchReturnUrl: '',
+    filteredBrowseHostBatchResolver: null,
+    filteredBrowseHostBatchTimeoutId: null,
+    filteredBrowseHostBatchDeadline: 0,
+    dismissedPoolSnapshotTimer: null,
     applyingCarouselPage: false,
     catalogIndicesBootstrapped: false,
     catalogModIdToIndex: {},
@@ -10132,6 +20098,28 @@
     filterUiLockUntil: 0,
     suppressFilterEvents: false,
     nexusFilterCooldownUntil: 0,
+    domFilterBrowseActive: false,
+    filteredBrowseEngaged: false,
+    controlsPinnedFilterRow: null,
+    controlsPinnedSortRow: null,
+    nexusFilteredTotalsCaptured: false,
+    nexusFilteredResultsTotal: 0,
+    nexusFilteredMatchingTotal: 0,
+    nexusFilteredDisplayTotalLocked: 0,
+    nexusFilteredGraphqlTotal: 0,
+    hadNumericNexusBrowseFilters: false,
+    refreshingDomFilteredBrowseState: false,
+    syncingFilteredHeadlinePass: false,
+    filteredBrowseLightScanInFlight: false,
+    numericFilteredHeadlineSyncTimer: null,
+    nexusFilteredGraphqlTotalSessionKey: '',
+    filteredBrowseTotalFetchInFlight: false,
+    filteredBrowseTotalFetchTimer: null,
+    resolvingDomActiveFilters: false,
+    syncingFilteredHeadlines: false,
+    filteredHeadlineSyncTimer: null,
+    userWantsNexusFiltersOpen: false,
+    nativeFilterCleanupScheduled: false,
     nexusFilterApplyInFlight: false,
     nexusFilterApplyStartUrl: '',
     nexusFilterRefreshTimer: null,
@@ -10152,6 +20140,11 @@
       beginCarouselQuietPeriod();
     },
 
+    releaseAuthPage: function () {
+      clearAuthPageEnhancement();
+      return { released: true };
+    },
+
     setTabActive: function (active) {
       if (active) {
         enhancer.enhancementFullyPaused = false;
@@ -10163,12 +20156,67 @@
 
       enhancer.enhancementFullyPaused = true;
       stopAutoAdvance();
-      stopChromeHideWatchdog();
-      releaseBrowseListEnhancements();
       return { active: false };
     },
 
     finalizeBrowseContextTransition: function () {
+      refreshDomFilteredBrowseState();
+      if ((enhancer.userDismissedTranslationFilter || urlHasActiveNexusFilters() ||
+          hasDomActiveNexusFilters() || hasSidebarDownloadsFilterApplied() ||
+          (this.config && (this.config.filterBrowseActive || isFilteredBrowseSession(this.config)))) &&
+          isBrowseModsListPathname(getBrowsePathname())) {
+        try {
+          clearCarouselQuietPeriod();
+          if (enhancer.userDismissedTranslationFilter) {
+            syncDismissedFilterBrowseState();
+          }
+          if (this.config && this.config.hideSiteChrome) {
+            applyDismissedBrowseHideChrome(this.config);
+          }
+          if (isDismissedCarouselBrowseMode(this.config || {})) {
+            prepareDismissedCarouselBrowse(this.config || {});
+          }
+          if (this.config && shouldUseNumericFilteredBrowseScan(this.config)) {
+            enhancer.domFilterBrowseActive = true;
+            enhancer.filteredBrowseEngaged = true;
+            var finalizePageSize = getCarouselPageSize(this.config);
+            var finalizeCatalogLen = (enhancer.filteredCarouselCatalog || []).length;
+            if (finalizeCatalogLen >= finalizePageSize &&
+                this.lastStats && this.lastStats.tileCount >= finalizePageSize) {
+              updateMinimalCarouselControlsInline(
+                this.config,
+                enhancer.filteredCarouselCatalog,
+                getLockedNexusFilteredDisplayTotal() || finalizeCatalogLen
+              );
+            } else {
+              this.lastStats = executeMinimalNumericFilteredBrowseScan(this.config);
+            }
+            try {
+              ensureCarouselControlsBar();
+            } catch (errFinalizeControls) {
+              // ignore
+            }
+          } else if (this.config && shouldUseFilteredBrowseLightScan(this.config)) {
+            this.lastStats = executeFilteredBrowseLightScan(this.config);
+          } else {
+            this.scheduleScan(true);
+          }
+          ensureNexusFiltersPanelStayOpen();
+        } catch (errFinalizeFiltered) {
+          if (this.config && shouldUseNumericFilteredBrowseScan(this.config)) {
+            try {
+              this.lastStats = executeMinimalNumericFilteredBrowseScan(this.config);
+            } catch (errFinalizeNumeric) {
+              logErrorToHost('finalize numeric browse failed', {
+                error: String(errFinalizeNumeric && errFinalizeNumeric.message || errFinalizeNumeric),
+              });
+            }
+          } else if (!(this.config && isFilteredBrowseSession(this.config) && shouldUseFilteredBrowseLightScan(this.config))) {
+            this.scheduleScan(true);
+          }
+        }
+        return;
+      }
       enhancer.carouselQuietUntil = 0;
       if (enhancer.carouselQuietTimer) {
         clearTimeout(enhancer.carouselQuietTimer);
@@ -10198,6 +20246,10 @@
     },
 
     update: function (nextConfig) {
+      if (isNexusAuthPage()) {
+        clearAuthPageEnhancement();
+        return this.lastStats || emptyScanStats(this.config);
+      }
       if (enhancer.optimisticFilters && nextConfig) {
         var optimisticNames = ['hideInstalled', 'onlyInstalled', 'hideTracked', 'onlyTracked'];
         optimisticNames.forEach(function (name) {
@@ -10262,7 +20314,12 @@
       }
 
       if (nextConfig && nextConfig.applyDefaultFilters) {
-        this.preferHideTranslations = true;
+        restoreTranslationDismissState();
+        if (!enhancer.userDismissedTranslationFilter) {
+          this.preferHideTranslations = true;
+        } else {
+          applyTranslationDismissRuntimeState();
+        }
       }
       if (nextConfig && nextConfig.gameNumericId) {
         this.gameNumericId = nextConfig.gameNumericId;
@@ -10324,7 +20381,53 @@
       if (nextConfig && !isLocalCatalogMode(nextConfig)) {
         scheduleBackgroundTrackedCatalogWarm(nextConfig);
       }
-      this.scheduleScan(true);
+      if (self.config && isFilteredBrowseSession(self.config)) {
+        if (enhancer.filteredBrowseLightScanInFlight || enhancer.scanInProgress) {
+          return attachHostLogs(self.lastStats || emptyScanStats(self.config), self.config);
+        }
+        try {
+          scheduleFilteredBrowseConfigTouch(self.config, prevConfig, nextConfig);
+        } catch (errUpdateFiltered) {
+          logErrorToHost('update filtered config touch failed', {
+            error: String(errUpdateFiltered && errUpdateFiltered.message || errUpdateFiltered),
+          });
+        }
+        if (shouldUseFilteredBrowseLightScan(self.config)) {
+          try {
+            self.lastStats = executeFilteredBrowseLightScan(self.config);
+          } catch (errFilteredLightUpdate) {
+            logErrorToHost('filtered update light scan failed', {
+              error: String(errFilteredLightUpdate && errFilteredLightUpdate.message || errFilteredLightUpdate),
+            });
+            self.lastStats = self.lastStats || emptyScanStats(self.config);
+          }
+          return attachHostLogs(self.lastStats, self.config);
+        }
+        if (shouldUseNumericFilteredBrowseScan(self.config)) {
+          var numericPageSize = getCarouselPageSize(self.config);
+          var numericCatalogLen = (enhancer.filteredCarouselCatalog || []).length;
+          if (numericCatalogLen >= numericPageSize &&
+              self.lastStats && self.lastStats.tileCount >= numericPageSize) {
+            updateMinimalCarouselControlsInline(
+              self.config,
+              enhancer.filteredCarouselCatalog,
+              getLockedNexusFilteredDisplayTotal() || numericCatalogLen
+            );
+            return attachHostLogs(self.lastStats, self.config);
+          }
+          try {
+            self.lastStats = executeNumericFilteredBrowseScan(self.config);
+          } catch (errNumericUpdate) {
+            logErrorToHost('numeric filtered update scan failed', {
+              error: String(errNumericUpdate && errNumericUpdate.message || errNumericUpdate),
+            });
+            self.lastStats = self.lastStats || emptyScanStats(self.config);
+          }
+          return attachHostLogs(self.lastStats, self.config);
+        }
+        scheduleNumericFilteredHeadlineSync();
+      }
+      return attachHostLogs(this.scheduleScan(true), self.config);
     },
 
     scheduleViewerStateFetch: function (modIds) {
@@ -10378,18 +20481,40 @@
         return self.lastStats || emptyScanStats(self.config);
       }
 
+      if (isTranslationDismissNavigationPending()) {
+        setTimeout(function () {
+          if (window.__vortexBrowseEnhancer) {
+            window.__vortexBrowseEnhancer.scheduleScan(true);
+          }
+        }, 450);
+        return self.lastStats || emptyScanStats(self.config);
+      }
+
       if (self.debounceTimer) {
         clearTimeout(self.debounceTimer);
       }
 
       if (immediate) {
-        self.lastStats = scan(self.config);
+        if (self.scanInProgress) {
+          return attachHostLogs(self.lastStats || emptyScanStats(self.config), self.config);
+        }
+        try {
+          self.lastStats = executeBrowseScan(self.config);
+        } catch (errScanNow) {
+          logErrorToHost('scan immediate failed', {
+            error: String(errScanNow && errScanNow.message || errScanNow),
+            stack: String(errScanNow && errScanNow.stack || ''),
+          });
+          self.lastStats = self.lastStats || emptyScanStats(self.config);
+        }
         self.scheduleRetryIfEmpty();
-        return self.lastStats;
+        return attachHostLogs(self.lastStats, self.config);
       }
 
       var debounceMs = 350;
-      if (self.config && isLocalCatalogMode(self.config) && enhancer.trackedCatalogActive) {
+      if (self.config && isFilteredBrowseSession(self.config)) {
+        debounceMs = shouldUseFilteredBrowseLightScan(self.config) ? 1400 : 900;
+      } else if (self.config && isLocalCatalogMode(self.config) && enhancer.trackedCatalogActive) {
         debounceMs = 150;
       } else if (self.config && self.config.onlyInstalled && !self.config.onlyTracked) {
         debounceMs = 900;
@@ -10397,9 +20522,18 @@
 
       self.debounceTimer = setTimeout(function () {
         self.debounceTimer = null;
-        self.lastStats = scan(self.config);
+        try {
+          self.lastStats = executeBrowseScan(self.config);
+        } catch (errScanDebounced) {
+          logErrorToHost('scan debounced failed', {
+            error: String(errScanDebounced && errScanDebounced.message || errScanDebounced),
+            stack: String(errScanDebounced && errScanDebounced.stack || ''),
+          });
+          self.lastStats = self.lastStats || emptyScanStats(self.config);
+        }
         self.scheduleRetryIfEmpty();
       }, debounceMs);
+      return attachHostLogs(self.lastStats || emptyScanStats(self.config), self.config);
     },
 
     scheduleRetryIfEmpty: function () {
@@ -10416,7 +20550,21 @@
       var attempts = 0;
       function retry() {
         attempts++;
-        self.lastStats = scan(self.config);
+        try {
+          if (self.config && shouldUseNumericFilteredBrowseScan(self.config)) {
+            self.lastStats = executeMinimalNumericFilteredBrowseScan(self.config);
+          } else if (self.config && shouldUseFilteredBrowseLightScan(self.config)) {
+            self.lastStats = executeFilteredBrowseLightScan(self.config);
+          } else {
+            self.lastStats = executeBrowseScan(self.config);
+          }
+        } catch (errRetryScan) {
+          logErrorToHost('scan retry failed', {
+            error: String(errRetryScan && errRetryScan.message || errRetryScan),
+            attempt: attempts,
+          });
+          self.lastStats = self.lastStats || emptyScanStats(self.config);
+        }
         if (self.lastStats.tileCount > 0 || attempts >= 20) {
           self.retryTimer = null;
           return;
@@ -10433,7 +20581,13 @@
         return;
       }
       self.observer = new MutationObserver(function (mutations) {
+        if (enhancer.syncingFilteredHeadlines) {
+          return;
+        }
         if (recoverFromBrowseOopsIfNeeded()) {
+          return;
+        }
+        if (isTranslationDismissNavigationPending()) {
           return;
         }
         if (enhancer.config && isLocalCatalogMode(enhancer.config) && enhancer.localCatalogBootstrapped) {
@@ -10448,10 +20602,23 @@
         if (enhancer.nexusFilterApplyInFlight) {
           return;
         }
-        if (enhancer.nexusFilterCooldownUntil && Date.now() < enhancer.nexusFilterCooldownUntil) {
+        if (enhancer.nexusFilterCooldownUntil && Date.now() < enhancer.nexusFilterCooldownUntil &&
+            !(enhancer.userDismissedTranslationFilter && isTranslationDismissHandsOff()) &&
+            !urlHasActiveNexusFilters()) {
           return;
         }
-        if (enhancer.applyingCarouselPage) {
+        if (enhancer.applyingCarouselPage || enhancer.dismissedPoolPagingActive) {
+          return;
+        }
+        if (enhancer.dismissedPoolPagingQuietUntil && Date.now() < enhancer.dismissedPoolPagingQuietUntil) {
+          return;
+        }
+        if (enhancer.filteredNexusPageNavInFlight) {
+          return;
+        }
+        if (enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil &&
+            enhancer.config && isFilteredBrowseSession(enhancer.config) &&
+            !mutationAddsLiveModTiles(mutations) && !gridVisibleTilesNeedDecoration(enhancer.config)) {
           return;
         }
         if (enhancer.trackedCatalogFetchInFlight && enhancer.trackedCatalogActive &&
@@ -10461,6 +20628,48 @@
         if (mutationTouchesOnlyEnhancerInternals(mutations)) {
           return;
         }
+        if (shouldUseNumericFilteredBrowseScan(enhancer.config)) {
+          if (enhancer.minimalNumericScanInProgress) {
+            return;
+          }
+          if (enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil) {
+            return;
+          }
+          var stableCatalogLen = (enhancer.filteredCarouselCatalog || []).length;
+          var stablePageSize = getCarouselPageSize(enhancer.config || {});
+          if (stableCatalogLen >= stablePageSize && !mutationAddsLiveModTiles(mutations)) {
+            return;
+          }
+          if (enhancer.numericMutationRescanTimer) {
+            clearTimeout(enhancer.numericMutationRescanTimer);
+          }
+          enhancer.numericMutationRescanTimer = setTimeout(function () {
+            enhancer.numericMutationRescanTimer = null;
+            if (!window.__vortexBrowseEnhancer ||
+                !shouldUseNumericFilteredBrowseScan(enhancer.config) ||
+                enhancer.minimalNumericScanInProgress) {
+              return;
+            }
+            if (enhancer.carouselPagingQuietUntil && Date.now() < enhancer.carouselPagingQuietUntil) {
+              return;
+            }
+            try {
+              enhancer.lastStats = executeMinimalNumericFilteredBrowseScan(enhancer.config);
+            } catch (errNumericMutationRescan) {
+              logErrorToHost('minimal numeric mutation rescan failed', {
+                error: String(errNumericMutationRescan && errNumericMutationRescan.message || errNumericMutationRescan),
+                step: enhancer.minimalNumericScanStep || '',
+              });
+            }
+          }, 650);
+          return;
+        }
+        if (enhancer.config && shouldUseFilteredBrowseLightScan(enhancer.config) &&
+            !mutationAddsLiveModTiles(mutations) &&
+            !gridVisibleTilesNeedDecoration(enhancer.config) &&
+            !enhancer.nativeNavFetchInFlight && !enhancer.dismissedBatchPrefetchInFlight) {
+          return;
+        }
         mutations.forEach(function (mutation) {
           if (mutation.addedNodes) {
             for (var i = 0; i < mutation.addedNodes.length; i++) {
@@ -10468,7 +20677,8 @@
             }
           }
         });
-        if (enhancer.config && enhancer.config.hideSiteChrome && !isBrowseEnhancementPaused()) {
+        if (enhancer.config && enhancer.config.hideSiteChrome && !isBrowseEnhancementPaused() &&
+            !(enhancer.config && urlHasActiveNexusFilters() && shouldUseFilteredBrowseLightScan(enhancer.config))) {
           scheduleChromeHideRefresh();
         }
         self.scheduleScan(false);
@@ -10483,10 +20693,39 @@
           recoverFromBrowseOopsIfNeeded();
         }, 2000);
       }
+
+      if (!enhancer.startupEnhancementWatchdogTimer) {
+        var startupWatchChecks = 0;
+        enhancer.startupEnhancementWatchdogTimer = setInterval(function () {
+          startupWatchChecks++;
+          if (startupWatchChecks > 30 || !window.__vortexBrowseEnhancer) {
+            clearInterval(enhancer.startupEnhancementWatchdogTimer);
+            enhancer.startupEnhancementWatchdogTimer = null;
+            return;
+          }
+          var cfg = enhancer.config;
+          if (!cfg || !browseNeedsEnhancementRecovery(cfg)) {
+            if (startupWatchChecks > 8 &&
+                document.querySelector('.vortex-enhanced-carousel-host')) {
+              clearInterval(enhancer.startupEnhancementWatchdogTimer);
+              enhancer.startupEnhancementWatchdogTimer = null;
+            }
+            return;
+          }
+          recoverBrowseEnhancementIfNeeded(cfg);
+          self.scheduleScan(true);
+        }, 1000);
+      }
     },
 
     getStats: function () {
-      return this.lastStats || scan(this.config);
+      if (this.lastStats) {
+        return this.lastStats;
+      }
+      if (shouldUseNumericFilteredBrowseScan(this.config)) {
+        return executeNumericFilteredBrowseScan(this.config);
+      }
+      return executeBrowseScan(this.config);
     },
   };
 
@@ -10547,14 +20786,85 @@
 
       var currentHref = window.location.href;
       if (currentHref !== lastBrowseHref) {
+        if (translationFilterDroppedBetweenHrefs(lastBrowseHref, currentHref)) {
+          acknowledgeUserTranslationFilterDismissal('url-watch');
+          enhancer.translationDismissNavPending = false;
+          enhancer.enhancementFullyPaused = false;
+          startTranslationDismissGuard();
+          if (window.__vortexBrowseEnhancer) {
+            window.__vortexBrowseEnhancer.scheduleScan(true);
+          }
+        }
         var paginationOnlyHrefChange = isNexusPaginationOnlyHrefChange(lastBrowseHref, currentHref);
+        var translationFilterHrefDrop = translationFilterDroppedBetweenHrefs(lastBrowseHref, currentHref);
         if (!paginationOnlyHrefChange &&
+            !translationFilterHrefDrop &&
             !enhancer.nexusFilterApplyInFlight &&
             (urlHasActiveNexusFilters(currentHref) || urlHasActiveNexusFilters(lastBrowseHref))) {
-          enhancer.nexusFilterCooldownUntil = Date.now() + 25000;
+          enhancer.nexusFilterCooldownUntil = Date.now() + (urlHasActiveNexusFilters(currentHref) ? 4000 : 25000);
           if (!enhancer.config || !enhancer.config.onlyTracked) {
-            enhancer.carouselQuietUntil = Math.max(enhancer.carouselQuietUntil || 0, Date.now() + 8000);
+            var filteredQuietMs = urlHasActiveNexusFilters(currentHref) ? 600 : 8000;
+            enhancer.carouselQuietUntil = Math.max(enhancer.carouselQuietUntil || 0, Date.now() + filteredQuietMs);
           }
+        }
+        var prevFilterSessionKey = getBrowseSessionKeyFromHref(lastBrowseHref);
+        var nextFilterSessionKey = getBrowseSessionKeyFromHref(currentHref);
+        if (!paginationOnlyHrefChange &&
+            nextFilterSessionKey !== prevFilterSessionKey &&
+            (urlHasActiveNexusFilters(currentHref) || urlHasActiveNexusFilters(lastBrowseHref))) {
+          // This also covers removing the final filter. Clear pooled later-page
+          // DOM before either the filtered or unfiltered scan takes over.
+          prepareCarouselForNativeFilterChange();
+        }
+        if (nextFilterSessionKey !== prevFilterSessionKey &&
+            urlHasActiveNexusFilters(currentHref) &&
+            enhancer.lastHostFilterNotifyKey !== nextFilterSessionKey) {
+          enhancer.lastHostFilterNotifyKey = nextFilterSessionKey;
+          clearCarouselQuietPeriod();
+          if (!enhancer.nexusFilterApplyInFlight) {
+            // Nexus briefly exposes the new filtered count as "matching"
+            // while retaining its full-catalog "results" label. Preserve the
+            // new count before clearing totals for the changed session.
+            var transitionTotals = scanNexusResultsTotalsFromDom();
+            var transitionFilteredTotal = transitionTotals.matchingTotal > 0
+              ? transitionTotals.matchingTotal
+              : resolveFilteredBrowseDisplayTotal(
+                transitionTotals.resultsTotal || 0,
+                transitionTotals.matchingTotal || 0
+              );
+            resetFilteredBrowseCatalogState();
+            resetFilteredBrowseTotalsState();
+            if (transitionFilteredTotal > 0) {
+              mergeNexusFilteredResultsTotal(transitionFilteredTotal);
+              lockNexusFilteredDisplayTotal(transitionFilteredTotal);
+            }
+            traceStep('filter-session-total-preserved', {
+              href: currentHref,
+              resultsTotal: transitionTotals.resultsTotal || 0,
+              matchingTotal: transitionTotals.matchingTotal || 0,
+              preservedTotal: transitionFilteredTotal || 0,
+            });
+            enhancer.globalPageIndex = 0;
+            enhancer.batchPageIndex = 0;
+            enhancer.lastAppliedSliceKey = '';
+            saveCarouselPagingState();
+          }
+          try {
+            sendToHost({
+              type: 'browse-navigate',
+              url: stripInternalBrowseParams(currentHref),
+              syncOnly: true,
+            });
+          } catch (errFilterHostNotify) {
+            // ignore
+          }
+          scheduleFilteredBrowseConfigTouch(enhancer.config || {}, null, enhancer.config || {});
+          if (window.__vortexBrowseEnhancer) {
+            window.__vortexBrowseEnhancer.finalizeBrowseContextTransition();
+          }
+        }
+        if (translationFilterHrefDrop) {
+          clearCarouselQuietPeriod();
         }
         if (enhancer.nexusFilterApplyInFlight && currentHref !== enhancer.nexusFilterApplyStartUrl) {
           setTimeout(function () {
@@ -10578,20 +20888,40 @@
         enhancer.browsePathname = pathname;
         window.__vortexBrowseEnhancer.finalizeBrowseContextTransition();
       } else if (prevWasList && nextSessionKey !== lastSessionKey) {
-        resetGlobalPagingSoft();
-        resetTranslationFilters();
-        enhancer.poolSessionKey = nextSessionKey;
-        enhancer.filteredFillAttempts = 0;
-        if (isActiveLocalCatalogMode()) {
-          enhancer.globalPageIndex = 0;
-          enhancer.trackedCatalogLoadedPage = -1;
-          enhancer.trackedCatalogPageCache = {};
-          enhancer.lastAppliedSliceKey = '';
-          clearLocalCatalogBootstrap();
-          ensureLocalCatalogInitialized(enhancer.config || {});
-          applyTrackedCatalogView(enhancer.config || {});
-        } else if (!isCarouselQuietPeriod() && !enhancer.nexusFilterApplyInFlight) {
-          beginCarouselQuietPeriod();
+        var translationOnlySessionChange =
+          translationFilterRemovedBetweenSessionKeys(lastSessionKey, nextSessionKey) ||
+          sessionKeyChangeIsTranslationOnly(lastSessionKey, nextSessionKey);
+        if (translationFilterRemovedBetweenSessionKeys(lastSessionKey, nextSessionKey)) {
+          acknowledgeUserTranslationFilterDismissal('session-watch');
+        }
+        if (translationOnlySessionChange) {
+          handleTranslationOnlyBrowseSessionChange(nextSessionKey);
+        } else {
+          resetGlobalPagingSoft();
+          resetTranslationFilters();
+          enhancer.poolSessionKey = nextSessionKey;
+          enhancer.filteredFillAttempts = 0;
+          if (isActiveLocalCatalogMode()) {
+            enhancer.globalPageIndex = 0;
+            enhancer.trackedCatalogLoadedPage = -1;
+            enhancer.trackedCatalogPageCache = {};
+            enhancer.lastAppliedSliceKey = '';
+            clearLocalCatalogBootstrap();
+            ensureLocalCatalogInitialized(enhancer.config || {});
+            applyTrackedCatalogView(enhancer.config || {});
+          } else if (!isCarouselQuietPeriod() && !enhancer.nexusFilterApplyInFlight &&
+                     !urlHasActiveNexusFilters()) {
+            beginCarouselQuietPeriod();
+          } else if (urlHasActiveNexusFilters()) {
+            enhancer.globalPageIndex = 0;
+            enhancer.batchPageIndex = 0;
+            enhancer.lastAppliedSliceKey = '';
+            saveCarouselPagingState();
+            clearCarouselQuietPeriod();
+            if (window.__vortexBrowseEnhancer) {
+              window.__vortexBrowseEnhancer.scheduleScan(true);
+            }
+          }
         }
       } else if (!prevWasList) {
         enhancer.poolSessionKey = nextSessionKey;
@@ -10602,6 +20932,86 @@
       lastPathname = pathname;
       lastSessionKey = nextSessionKey;
     }, 400);
+  }
+
+  function installNexusActiveFilterDismissCapture() {
+    if (window.__vortexBrowseEnhancerActiveFilterDismissCapture) {
+      return;
+    }
+    window.__vortexBrowseEnhancerActiveFilterDismissCapture = true;
+
+    document.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) {
+        return;
+      }
+      if (!isBrowseModsListPathname(getBrowsePathname())) {
+        return;
+      }
+
+      var clearEl = event.target.closest('.vortex-enhanced-nexus-clear-all, a, button, [role="button"]');
+      if (clearEl && isClearAllControl(clearEl) && isInMainBrowseColumn(clearEl)) {
+        acknowledgeUserTranslationFilterDismissal('clear-all-capture');
+        return;
+      }
+
+      if (isTranslationFilterChipNode(event.target)) {
+        acknowledgeUserTranslationFilterDismissal('chip-capture');
+      }
+    }, true);
+  }
+
+  function installNexusActiveFilterPointerFallback() {
+    if (window.__vortexBrowseEnhancerActiveFilterPointerFallback) {
+      return;
+    }
+    window.__vortexBrowseEnhancerActiveFilterPointerFallback = true;
+
+    document.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) {
+        return;
+      }
+      if (!isBrowseModsListPathname(getBrowsePathname())) {
+        return;
+      }
+
+      var row = document.querySelector('.vortex-enhanced-nexus-active-filters');
+      if (!row) {
+        return;
+      }
+
+      var x = event.clientX;
+      var y = event.clientY;
+      var rowRect = row.getBoundingClientRect();
+      if (x < rowRect.left || x > rowRect.right || y < rowRect.top || y > rowRect.bottom) {
+        return;
+      }
+
+      if (event.target.closest('.vortex-enhanced-nexus-active-filters, .vortex-enhanced-nexus-clear-all')) {
+        return;
+      }
+
+      var controls = row.querySelectorAll(
+        'button, a, [role="button"], .vortex-enhanced-nexus-clear-all'
+      );
+      for (var i = 0; i < controls.length; i++) {
+        var control = controls[i];
+        var controlRect = control.getBoundingClientRect();
+        if (x < controlRect.left || x > controlRect.right ||
+            y < controlRect.top || y > controlRect.bottom) {
+          continue;
+        }
+
+        noteNexusActiveFilterUserAction(event);
+
+        var actionTarget = resolveNexusFilterChipActionTarget(control, row) ||
+          control.closest('button, a, [role="button"]') ||
+          control;
+        event.preventDefault();
+        event.stopPropagation();
+        triggerNativeFilterControlClick(actionTarget);
+        return;
+      }
+    }, true);
   }
 
   function installModTileNavigationHandler() {
@@ -10634,16 +21044,22 @@
     }, true);
   }
 
+  noteBrowseGameContext(getBrowsePathname());
+  restoreTranslationDismissState();
   enhancer.init();
   installBrowseUrlWatcher();
+  installNexusActiveFilterDismissCapture();
+  installNexusActiveFilterPointerFallback();
   installModTileNavigationHandler();
   enhancer.showToast = showNexusStyleToast;
   enhancer.clearPending = function (action, modId) {
     setFooterActionPending(action, modId, false);
     this.scheduleScan(true);
   };
+  enhancer.reattachDocumentHooks = reattachDocumentHooks;
   window.__vortexBrowseEnhancer = enhancer;
   ensureStyles();
+  reattachDocumentHooks();
 
   function beginInstall(btn) {
     var modId = parseInt(btn.getAttribute('data-mod-id'), 10);
@@ -10693,6 +21109,14 @@
 
     var currentlyTracked = btn.classList.contains('is-tracked');
     var nextTracked = !currentlyTracked;
+    if (enhancer.config) {
+      enhancer.config.tracked = Object.assign({}, enhancer.config.tracked || {}, {});
+      if (nextTracked) {
+        enhancer.config.tracked[String(modId)] = true;
+      } else {
+        delete enhancer.config.tracked[String(modId)];
+      }
+    }
     setFooterActionPending('track', modId, true, nextTracked);
     btn.disabled = true;
     btn.classList.add('is-pending');
@@ -10778,6 +21202,9 @@
       if (enhancer.allowNexusPaginationClick) {
         return;
       }
+      if (event.target.closest('.vortex-enhanced-nexus-active-filters, .vortex-enhanced-nexus-clear-all')) {
+        return;
+      }
       var link = event.target.closest('a, button');
       if (!link || !isNexusResultsPagination(link)) {
         return;
@@ -10828,6 +21255,10 @@
     if (!targetUrl || targetUrl.indexOf('nexusmods.com') < 0) {
       return false;
     }
+    if (enhancer.userDismissedTranslationFilter) {
+      targetUrl = buildUrlWithoutTranslationExcludedTag(targetUrl);
+    }
+    targetUrl = stripInternalBrowseParams(targetUrl);
     enhancer.nexusFilterApplyInFlight = true;
     enhancer.pendingNexusFilterUrl = targetUrl;
     enhancer.nexusFilterApplyStartUrl = window.location.href;
@@ -10836,11 +21267,22 @@
     try {
       window.location.replace(targetUrl);
     } catch (errNav) {
-      window.location.href = targetUrl;
+      try {
+        window.location.href = targetUrl;
+      } catch (errHref) {
+        enhancer.nexusFilterApplyInFlight = false;
+        enhancer.pendingNexusFilterUrl = '';
+        return false;
+      }
+    }
+    try {
+      sendToHost({ type: 'browse-navigate', url: targetUrl, syncOnly: true });
+    } catch (errHostSync) {
+      // ignore
     }
     setTimeout(function () {
       releaseNexusFilterApplyWhenStable(0);
-    }, 600);
+    }, 700);
     return true;
   }
 
@@ -10881,14 +21323,30 @@
     if (!document.body) {
       return false;
     }
-    var bodyText = (document.body.textContent || '').replace(/\s+/g, ' ').trim();
-    if (/oops!? something went wrong|something went wrong|unexpected error|try again later|page could not be loaded/i.test(bodyText)) {
-      return true;
-    }
     var headings = document.querySelectorAll('h1, h2, h3, [role="heading"]');
-    for (var i = 0; i < headings.length; i++) {
-      var headingText = (headings[i].textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    for (var i = 0; i < headings.length && i < 16; i++) {
+      var headingText = normalizeUiText(headings[i].textContent || '');
       if (headingText.indexOf('oops') >= 0 || headingText.indexOf('something went wrong') >= 0) {
+        return true;
+      }
+    }
+    var roots = [
+      document.getElementById('mainContent'),
+      document.querySelector('main'),
+      document.body,
+    ];
+    var seenRoot = {};
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      if (!root || seenRoot[root]) {
+        continue;
+      }
+      seenRoot[root] = true;
+      var sample = normalizeUiText(root.textContent || '');
+      if (sample.length > 4000) {
+        sample = sample.slice(0, 4000);
+      }
+      if (/oops!? something went wrong|something went wrong|unexpected error|try again later|page could not be loaded/i.test(sample)) {
         return true;
       }
     }
@@ -10905,18 +21363,64 @@
     }
   }
 
+  function resolveBrowseOopsRecoveryUrl() {
+    var recoveryUrl = enhancer.pendingNexusFilterUrl ||
+      (urlHasActiveNexusFilters(window.location.href) ? window.location.href : '') ||
+      readNexusFilterFormUrl() ||
+      enhancer.lastGoodBrowseUrl ||
+      window.location.href;
+    if (enhancer.userDismissedTranslationFilter) {
+      recoveryUrl = buildUrlWithoutTranslationExcludedTag(recoveryUrl) || recoveryUrl;
+    }
+    return stripInternalBrowseParams(recoveryUrl);
+  }
+
+  function recoverDismissedBrowseOopsIfNeeded() {
+    if (!isBrowseOopsPage() || !enhancer.userDismissedTranslationFilter) {
+      return false;
+    }
+    if (urlHasActiveNexusFilters()) {
+      return recoverFromBrowseOopsIfNeeded();
+    }
+    var now = Date.now();
+    if (enhancer.oopsRecoveryInFlight && enhancer.oopsRecoveryStartedAt &&
+        now - enhancer.oopsRecoveryStartedAt < 3000) {
+      return true;
+    }
+    var attempts = enhancer.oopsRecoveryAttempts || 0;
+    if (attempts >= 6) {
+      return true;
+    }
+    enhancer.oopsRecoveryInFlight = true;
+    enhancer.oopsRecoveryStartedAt = now;
+    enhancer.oopsRecoveryAttempts = attempts + 1;
+    clearEnhancerLocks();
+    enhancer.translationDismissNavPending = false;
+    enhancer.enhancementFullyPaused = false;
+    var recoveryUrl = resolveBrowseOopsRecoveryUrl();
+    navigateBrowseUrlViaHost(recoveryUrl);
+    setTimeout(function () {
+      enhancer.oopsRecoveryInFlight = false;
+      if (window.__vortexBrowseEnhancer) {
+        window.__vortexBrowseEnhancer.scheduleScan(true);
+      }
+    }, 1500);
+    return true;
+  }
+
   function recoverFromBrowseOopsIfNeeded() {
     if (!isBrowseOopsPage()) {
       enhancer.oopsRecoveryAttempts = 0;
       enhancer.oopsRecoveryInFlight = false;
       return false;
     }
-    if (enhancer.nexusFilterApplyInFlight && enhancer.pendingNexusFilterUrl) {
-      var filterRetryUrl = appendBrowseReloadParam(enhancer.pendingNexusFilterUrl);
-      if (filterRetryUrl !== window.location.href) {
-        navigateNexusFilterInWebview(filterRetryUrl);
-      }
-      return true;
+    if (isTranslationFilterDismissedBrowse() && !urlHasActiveNexusFilters() &&
+        !enhancer.pendingNexusFilterUrl) {
+      return recoverDismissedBrowseOopsIfNeeded();
+    }
+    if (shouldDeferDismissLayoutCollapse() && !urlHasActiveNexusFilters() &&
+        !enhancer.pendingNexusFilterUrl) {
+      return false;
     }
     var now = Date.now();
     if (enhancer.oopsRecoveryInFlight && enhancer.oopsRecoveryStartedAt &&
@@ -10930,18 +21434,43 @@
     enhancer.oopsRecoveryInFlight = true;
     enhancer.oopsRecoveryStartedAt = now;
     enhancer.oopsRecoveryAttempts = attempts + 1;
-    var recoveryUrl = appendBrowseReloadParam(
-      enhancer.pendingNexusFilterUrl ||
-      readNexusFilterFormUrl() ||
-      (urlHasActiveNexusFilters(window.location.href) ? window.location.href : '') ||
-      enhancer.lastGoodBrowseUrl ||
-      window.location.href
-    );
+    if (shouldUseClientSideNumericFilterApply() ||
+        (enhancer.stashedSidebarNumericFilters && enhancer.stashedSidebarNumericFilters.length)) {
+      return recoverBrowseOopsViaClientSideNumeric();
+    }
+    var recoveryUrl = resolveBrowseOopsRecoveryUrl();
+    var filterRecovery = urlHasActiveNexusFilters(recoveryUrl) &&
+      (urlHasNumericNexusFilters(recoveryUrl) || hasNonDefaultNexusFilterChip());
+    if (!filterRecovery) {
+      recoveryUrl = appendBrowseReloadParam(recoveryUrl);
+    }
+    logToHost('browse oops detected in webview', {
+      filterRecovery: filterRecovery,
+      attempts: attempts + 1,
+      filterApplyInFlight: !!enhancer.nexusFilterApplyInFlight,
+    });
     clearEnhancerLocks();
     enhancer.nexusFilterApplyInFlight = false;
     enhancer.enhancementFullyPaused = false;
     enhancer.pendingNexusFilterUrl = recoveryUrl;
-    sendToHost({ type: 'browse-navigate', url: recoveryUrl });
+    if (filterRecovery) {
+      try {
+        window.location.replace(recoveryUrl);
+      } catch (errFilterRecover) {
+        try {
+          window.location.href = recoveryUrl;
+        } catch (errFilterHref) {
+          navigateBrowseUrlViaHost(recoveryUrl, { syncOnly: true });
+        }
+      }
+      try {
+        sendToHost({ type: 'browse-navigate', url: recoveryUrl, syncOnly: true });
+      } catch (errFilterRecoverHost) {
+        // ignore
+      }
+    } else {
+      navigateBrowseUrlViaHost(recoveryUrl);
+    }
     setTimeout(function () {
       enhancer.oopsRecoveryInFlight = false;
       clearEnhancerLocks();
@@ -10964,7 +21493,7 @@
         recoverFromBrowseOopsIfNeeded();
         return;
       }
-      var targetUrl = appendBrowseReloadParam(buildNexusFilterApplyUrl());
+      var targetUrl = stripInternalBrowseParams(buildNexusFilterApplyUrl());
       if (!targetUrl) {
         return;
       }
@@ -10973,23 +21502,30 @@
   }
 
   function buildNexusFilterApplyUrl() {
-    var formUrl = readNexusFilterFormUrl();
-    if (formUrl) {
-      return formUrl;
-    }
-
     try {
       var url = new URL(window.location.href);
       url.searchParams.set('count', String(enhancer.nexusPageSizeTarget || 80));
-      if (enhancer.clientHideTranslations || enhancer.forceDefaultFilters) {
+      if (shouldApplyTranslationFilter()) {
         var tags = url.searchParams.getAll('excludedTag');
         if (tags.indexOf('Translation') < 0) {
           url.searchParams.append('excludedTag', 'Translation');
         }
+      } else {
+        var keptApplyTags = url.searchParams.getAll('excludedTag').filter(function (tag) {
+          return !/translation/i.test(String(tag));
+        });
+        url.searchParams.delete('excludedTag');
+        keptApplyTags.forEach(function (tag) {
+          url.searchParams.append('excludedTag', tag);
+        });
       }
 
       var panel = findNexusFilterAside();
       if (panel) {
+        // A form's action does not include its current control values. Build
+        // from the live URL and explicitly replace the adult state below.
+        url.searchParams.delete('showAdultContent');
+        url.searchParams.delete('adultContent');
         var inputs = panel.querySelectorAll('input[type="checkbox"], button[role="checkbox"], [role="checkbox"]');
         for (var i = 0; i < inputs.length; i++) {
           var input = inputs[i];
@@ -11055,9 +21591,9 @@
 
       url.searchParams.delete('page');
       url.searchParams.delete('offset');
-      return url.href;
+      return finalizeNexusFilterApplyUrl(url.href);
     } catch (errApplyUrl) {
-      return window.location.href;
+      return finalizeNexusFilterApplyUrl(window.location.href);
     }
   }
 
@@ -11068,13 +21604,20 @@
 
     var liveTiles = document.querySelectorAll('[data-e2eid="mod-tile"]:not([data-vortex-pool-tile])').length;
     var poolTiles = document.querySelectorAll('#vortex-enhanced-pool-host [data-e2eid="mod-tile"]').length;
-    var stable = liveTiles >= 12 || poolTiles >= 12;
+    var stable = liveTiles >= 4 || poolTiles >= 4;
     var urlChanged = enhancer.nexusFilterApplyStartUrl &&
       window.location.href !== enhancer.nexusFilterApplyStartUrl;
     var oopsPage = isBrowseOopsPage();
 
-    if (oopsPage && enhancer.pendingNexusFilterUrl && attempt >= 2) {
-      navigateNexusFilterInWebview(appendBrowseReloadParam(enhancer.pendingNexusFilterUrl));
+    if (oopsPage && attempt >= 3) {
+      logToHost('filter apply landed on oops page', { attempt: attempt });
+      recoverFromBrowseOopsIfNeeded();
+      return;
+    }
+    if (oopsPage) {
+      setTimeout(function () {
+        releaseNexusFilterApplyWhenStable(attempt + 1);
+      }, 250);
       return;
     }
 
@@ -11084,6 +21627,17 @@
       enhancer.nexusFilterApplyStartUrl = '';
       enhancer.pendingNexusFilterUrl = '';
       enhancer.carouselQuietUntil = 0;
+      if (urlHasActiveNexusFilters()) {
+        clearStaleFilteredBrowseFetchLocks();
+      }
+      restoreMainBrowseContentVisibility();
+      if (!browseUrlHasRemovableActiveFilters()) {
+        if (enhancer.userDismissedTranslationFilter) {
+          syncDismissedFilterBrowseState();
+        } else {
+          finalizeDismissedFilterLayout();
+        }
+      }
       if (isBrowseModsListPathname(getBrowsePathname()) && !isBrowseOopsPage()) {
         try {
           enhancer.lastGoodBrowseUrl = window.location.href;
@@ -11091,50 +21645,216 @@
           // ignore
         }
       }
+      var didFilteredEnhance = false;
+      if (isNexusFilteredBrowse() && isBrowseModsListPathname(getBrowsePathname()) && !isBrowseOopsPage()) {
+        var releaseConfig = enhancer.config || {};
+        enhancer.domFilterBrowseActive = true;
+        enhancer.filteredBrowseEngaged = true;
+        refreshDomFilteredBrowseState();
+        enhancer.globalPageIndex = 0;
+        enhancer.batchPageIndex = 0;
+        enhancer.lastAppliedSliceKey = '';
+        if (shouldUseNumericFilteredBrowseScan(releaseConfig) || hasNumericNexusBrowseFilters()) {
+          scheduleFilteredBrowseTotalFetch(releaseConfig);
+          executeMinimalNumericFilteredBrowseScan(releaseConfig);
+          didFilteredEnhance = true;
+          logToHost('filter apply numeric minimal scan', {
+            tiles: (enhancer.filteredCarouselCatalog || []).length,
+          });
+        } else {
+          scheduleFilteredBrowseTotalFetch(releaseConfig);
+          pinNexusFilteredResultsTotal();
+          syncNexusFilteredResultsHeadlines();
+          scheduleFilteredResultsHeadlineResync();
+          resetFilteredCarouselCatalog();
+          mergeIntoFilteredCarouselCatalog(collectLiveGridCards(releaseConfig), releaseConfig);
+          if (enhancer.tilePool && enhancer.tilePool.length) {
+            mergeIntoFilteredCarouselCatalog(collectCards(releaseConfig), releaseConfig);
+          }
+          applyFilteredNexusDirectPage(releaseConfig, { skipDecorationRetry: true });
+          decorateVisibleFilteredCarouselTiles(releaseConfig);
+          didFilteredEnhance = true;
+        }
+        try {
+          sendToHost({
+            type: 'browse-navigate',
+            url: stripInternalBrowseParams(window.location.href),
+            syncOnly: true,
+          });
+        } catch (errFilterReleaseHost) {
+          // ignore
+        }
+      }
       if (window.__vortexBrowseEnhancer) {
-        window.__vortexBrowseEnhancer.finalizeBrowseContextTransition();
-        window.__vortexBrowseEnhancer.scheduleScan(true);
+        if (enhancer.userDismissedTranslationFilter) {
+          prepareDismissedCarouselBrowse(enhancer.config || {});
+          enhancer.lastAppliedSliceKey = '';
+          enhancer.globalPageIndex = 0;
+          enhancer.batchPageIndex = 0;
+          window.__vortexBrowseEnhancer.scheduleScan(true);
+        } else {
+          window.__vortexBrowseEnhancer.finalizeBrowseContextTransition();
+          if (!didFilteredEnhance) {
+            window.__vortexBrowseEnhancer.scheduleScan(true);
+          }
+        }
       }
       return;
     }
 
     setTimeout(function () {
+      if (liveTiles >= 4 || poolTiles >= 4) {
+        try {
+          decorateVisibleGridTiles(enhancer.config || {}, { forceAll: true });
+        } catch (errEarlyDecorate) {
+          // ignore
+        }
+      }
       releaseNexusFilterApplyWhenStable(attempt + 1);
-    }, 400);
+    }, 200);
   }
 
-  if (!window.__vortexBrowseEnhancerNexusApplyCapture) {
-    window.__vortexBrowseEnhancerNexusApplyCapture = true;
-    document.addEventListener('click', function (event) {
-      var nexusBtn = event.target.closest('button');
-      if (!nexusBtn) {
+  function isNexusSidebarApplyTarget(target) {
+    if (!target || !target.closest) {
+      return null;
+    }
+    var control = target.closest('button, input[type="submit"], [role="button"]');
+    if (!control) {
+      return null;
+    }
+    var filterPanel = control.closest('#filters-panel') || control.closest('aside');
+    if (!filterPanel || filterPanel.closest('[data-vortex-enhanced-filters="true"]')) {
+      return null;
+    }
+    var label = normalizeUiText(
+      control.textContent ||
+      control.getAttribute('aria-label') ||
+      control.getAttribute('value') ||
+      ''
+    ).toLowerCase();
+    if (label !== 'apply' &&
+        label.indexOf('apply filter') !== 0 &&
+        label !== 'apply filters') {
+      return null;
+    }
+    return control;
+  }
+
+  function handleNexusSidebarFilterApply(event) {
+    prepareCarouselForNativeFilterChange();
+    enhancer.clientSideNumericFilterSkipKey = '';
+    stashSidebarNumericFilters();
+    var useClientSide = shouldUseClientSideNumericFilterApply();
+    traceStep('nexus-filter-apply-intercept', {
+      clientSide: useClientSide,
+      stashed: (enhancer.stashedSidebarNumericFilters || []).length,
+    });
+    if (useClientSide) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+          event.stopImmediatePropagation();
+        }
+      }
+      enhancer.nexusFilterCooldownUntil = Date.now() + 25000;
+      enhancer.carouselQuietUntil = Math.max(enhancer.carouselQuietUntil || 0, Date.now() + 2000);
+      enhancer.lastAppliedSliceKey = '';
+      resetFilteredBrowseCatalogState();
+      applySidebarNumericFiltersViaGraphql(enhancer.config);
+      return true;
+    }
+
+    // buildNexusFilterApplyUrl serializes the live controls. A form action
+    // alone contains no selected checkbox/input values.
+    var targetUrl = buildNexusFilterApplyUrl();
+    if (!targetUrl) {
+      return false;
+    }
+    traceStep('nexus-filter-apply-url', {
+      targetUrl: targetUrl,
+      currentUrl: window.location.href,
+    });
+
+    enhancer.nexusFilterApplyInFlight = true;
+    enhancer.nexusFilterApplyStartUrl = window.location.href;
+    enhancer.pendingNexusFilterUrl = targetUrl;
+    enhancer.nexusFilterCooldownUntil = Date.now() + 25000;
+    enhancer.carouselQuietUntil = Math.max(enhancer.carouselQuietUntil || 0, Date.now() + 2000);
+    enhancer.lastAppliedSliceKey = '';
+    resetFilteredBrowseCatalogState();
+    resetFilteredBrowseTotalsState();
+    enhancer.carouselPagingQuietUntil = Date.now() + 8000;
+
+    setTimeout(function () {
+      releaseNexusFilterApplyWhenStable(0);
+    }, 300);
+    return true;
+  }
+
+  function ensureNexusFilterApplyCapture() {
+    if (!markVortexDocumentHook('nexus-apply-capture')) {
+      return;
+    }
+    document.addEventListener('pointerdown', function (event) {
+      if (!isNexusSidebarApplyTarget(event.target)) {
         return;
       }
-      var filterPanel = nexusBtn.closest('#filters-panel') || nexusBtn.closest('aside');
+      noteNexusFilterPanelInteraction();
+      handleNexusSidebarFilterApply(event);
+    }, true);
+    document.addEventListener('click', function (event) {
+      if (!isNexusSidebarApplyTarget(event.target)) {
+        return;
+      }
+      noteNexusFilterPanelInteraction();
+      handleNexusSidebarFilterApply(event);
+    }, true);
+    document.addEventListener('submit', function (event) {
+      var form = event.target;
+      if (!form || !form.closest) {
+        return;
+      }
+      var filterPanel = form.closest('#filters-panel') || form.closest('aside');
       if (!filterPanel || filterPanel.closest('[data-vortex-enhanced-filters="true"]')) {
         return;
       }
-      var btnLabel = (nexusBtn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (btnLabel !== 'apply' && btnLabel.indexOf('apply filter') !== 0) {
-        return;
-      }
-
-      var targetUrl = readNexusFilterFormUrl() || buildNexusFilterApplyUrl();
-      if (!targetUrl) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-
-      enhancer.nexusFilterApplyInFlight = true;
-      enhancer.nexusFilterApplyStartUrl = window.location.href;
-      enhancer.pendingNexusFilterUrl = targetUrl;
-      enhancer.nexusFilterCooldownUntil = Date.now() + 25000;
-      enhancer.carouselQuietUntil = Math.max(enhancer.carouselQuietUntil || 0, Date.now() + 10000);
-
-      navigateNexusFilterInWebview(targetUrl);
+      noteNexusFilterPanelInteraction();
+      handleNexusSidebarFilterApply(event);
     }, true);
+  }
+
+  function ensureCarouselControlClickCapture() {
+    if (!markVortexDocumentHook('carousel-control-click')) {
+      return;
+    }
+    document.addEventListener('click', function (event) {
+      var carouselBtn = event.target.closest('.vortex-enhanced-carousel-btn[data-carousel]');
+      if (!carouselBtn) {
+        return;
+      }
+      // Buttons mounted by ensureCarouselControls have their own capture
+      // handler. The document fallback must not process the same click too.
+      if (carouselBtn.getAttribute('data-vortex-bound') === '1') {
+        return;
+      }
+      var delta = parseInt(carouselBtn.getAttribute('data-carousel'), 10);
+      if (delta) {
+        event.preventDefault();
+        if (shouldUseNumericFilteredBrowseScan(enhancer.config)) {
+          advanceNumericFilteredCarouselPage(enhancer.config, delta);
+        } else {
+          advanceCarouselPage(delta);
+        }
+      }
+    }, true);
+  }
+
+  function reattachDocumentHooks() {
+    ensureNexusFilterInteractionCapture();
+    ensureNexusFilterApplyCapture();
+    ensureCarouselControlClickCapture();
+    installCarouselWheelHandler();
   }
 
   if (!window.__vortexBrowseEnhancerFilterUi) {
@@ -11160,6 +21880,7 @@
 
       if ((input.closest('#filters-panel') || input.closest('aside')) &&
           !input.closest('[data-vortex-enhanced-filters="true"]')) {
+        noteNexusFilterPanelInteraction();
         enhancer.nexusFilterCooldownUntil = Date.now() + 8000;
         return;
       }
@@ -11224,45 +21945,28 @@
     document.addEventListener('click', function (event) {
       var nexusFilterRoot = event.target.closest('#filters-panel') || event.target.closest('aside');
       if (nexusFilterRoot && !event.target.closest('[data-vortex-enhanced-filters="true"]')) {
-        if (!event.target.closest('input[type="checkbox"], label, [role="checkbox"], button[role="checkbox"]')) {
-          enhancer.nexusFilterCooldownUntil = Date.now() + 20000;
-        }
-      }
-
-      var carouselBtn = event.target.closest('.vortex-enhanced-carousel-btn[data-carousel]');
-      if (carouselBtn) {
-        var delta = parseInt(carouselBtn.getAttribute('data-carousel'), 10);
-        if (delta) {
-          event.preventDefault();
-          advanceCarouselPage(delta);
-        }
-        return;
+        noteNexusFilterPanelInteraction();
       }
 
       var nexusFilterBtn = event.target.closest('button');
       if (nexusFilterBtn) {
         var filterLabel = (nexusFilterBtn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
         if (filterLabel.indexOf('show filters') === 0 || filterLabel.indexOf('hide filters') === 0) {
-          var aside = findNexusFilterAside();
-          if (aside) {
-            if (filterLabel.indexOf('show filters') === 0) {
-              aside.classList.add('vortex-enhanced-nexus-filters-open');
-              aside.classList.remove('vortex-enhanced-chrome-hidden', 'vortex-enhanced-browse-trim-hidden');
-            } else {
-              aside.classList.remove('vortex-enhanced-nexus-filters-open');
-            }
-          }
-          setTimeout(function () {
-            syncNexusFiltersState(enhancer.config);
-            if (enhancer.config && enhancer.config.hideSiteChrome) {
-              applyHideSiteChrome(enhancer.config);
-            }
-            cleanupInvalidToolbarRows();
-            enhancer.scheduleScan(true);
-          }, 120);
-          setTimeout(function () {
-            enhancer.scheduleScan(true);
-          }, 500);
+          var openingFilters = filterLabel.indexOf('show filters') === 0;
+          markNexusFiltersPanelOpen(openingFilters);
+          [80, 260, 700, 1400].forEach(function (delayMs) {
+            setTimeout(function () {
+              if (openingFilters || isNexusFiltersPanelVisible()) {
+                markNexusFiltersPanelOpen(true);
+              }
+              syncNexusFiltersState(enhancer.config);
+              protectNexusActiveFiltersRow();
+              if (enhancer.config && enhancer.config.hideSiteChrome) {
+                applyHideSiteChrome(enhancer.config);
+              }
+              cleanupInvalidToolbarRows();
+            }, delayMs);
+          });
         }
       }
 
@@ -11347,7 +22051,7 @@
         return;
       }
 
-      if (isActiveLocalCatalogMode()) {
+        if (isActiveLocalCatalogMode()) {
         navigateBrowseSortOption(option);
         return;
       }
@@ -11361,6 +22065,17 @@
         enhancer.browsePathname = getBrowsePathname();
       }
       enterLiveCarouselMode(8000);
+      var scheduleDismissedChromeRefresh = function () {
+        if (!enhancer.config || !enhancer.config.hideSiteChrome) {
+          return;
+        }
+        if (isTranslationFilterDismissedBrowse()) {
+          applyDismissedBrowseHideChrome(enhancer.config);
+        } else {
+          hideNexusChromeAboveGrid();
+          hideNexusGameBannerStrip();
+        }
+      };
       try {
         sendToHost({
           type: 'browse-navigate',
@@ -11369,6 +22084,9 @@
       } catch (errNav) {
         window.location.assign(nextPath);
       }
+      [120, 400, 900, 1800].forEach(function (delay) {
+        setTimeout(scheduleDismissedChromeRefresh, delay);
+      });
     }, true);
 
     document.addEventListener('click', function (event) {
@@ -11382,4 +22100,5 @@
       event.stopImmediatePropagation();
     }, true);
   }
+
 })();
